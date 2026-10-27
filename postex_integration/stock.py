@@ -298,6 +298,9 @@ def _create_invoices(config, result, limit):
 					"cash collected by courier",
 				}
 			)
+			# DeliveryNoteItem has no income_account; the account lives on the
+			# Sales Order item, which is the correct source anyway.
+			income_by_so_item = {item.name: item.get("income_account") for item in so.items}
 			for dn_item in dn.items:
 				si.append(
 					"items",
@@ -316,7 +319,8 @@ def _create_invoices(config, result, limit):
 						"sales_order": so.name,
 						"so_detail": dn_item.so_detail,
 						"cost_center": dn_item.cost_center or config.cost_center,
-						"income_account": dn_item.income_account,
+						"income_account": income_by_so_item.get(dn_item.so_detail)
+						or dn_item.get("income_account"),
 					},
 				)
 			if not si.items:

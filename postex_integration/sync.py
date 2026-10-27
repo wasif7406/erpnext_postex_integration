@@ -181,7 +181,10 @@ def _sync_orders(account, client, ref_map, result, limit):
 		tracking = (order.custom_postex_tracking_number or "").strip()
 		payload = ref_map.get(reference) if reference else None
 
-		if payload is None and tracking:
+		if payload is None and tracking and (order.get("custom_courier") or "") in (
+			"",
+			POSTEX_COURIER,
+		):
 			key = tracking.replace(" ", "")
 			if key in looked_up:
 				payload = looked_up[key]
