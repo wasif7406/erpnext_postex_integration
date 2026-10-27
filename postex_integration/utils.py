@@ -129,3 +129,16 @@ def now():
 
 def money(value) -> float:
 	return flt(value, 2)
+
+
+def net_rate(amount, qty) -> float:
+	"""Per-unit rate that reproduces an exact line amount.
+
+	ERPNext recomputes `amount = qty x rate`, so a line with a discount or a zero
+	rate must be passed as its **net** rate; passing `rate` alone lets ERPNext
+	re-price a zero rate from the price list.
+	"""
+	qty = flt(qty)
+	if qty <= 0:
+		return 0.0
+	return money(flt(amount) / qty)

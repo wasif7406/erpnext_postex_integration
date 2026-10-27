@@ -17,7 +17,7 @@ from .constants import (
 	PICKUP_STATUSES,
 	POSTEX_COURIER,
 )
-from .utils import exclude_historical, log_error, submit
+from .utils import exclude_historical, log_error, net_rate, submit
 
 
 # ---------------------------------------------------------------------------
@@ -229,8 +229,9 @@ def _create_delivery_notes(config, result, limit):
 						"uom": item.uom,
 						"stock_uom": item.stock_uom,
 						"conversion_factor": 1,
-						"rate": item.rate,
-						"price_list_rate": item.price_list_rate,
+						# net rate, so a discounted or zero-priced order keeps its amount
+						"rate": net_rate(item.get("net_amount") or item.amount, qty),
+						"price_list_rate": net_rate(item.get("net_amount") or item.amount, qty),
 						"warehouse": config.in_transit_warehouse,
 						"against_sales_order": so.name,
 						"so_detail": item.name,
@@ -285,7 +286,8 @@ def _create_invoices(config, result, limit):
 					"company": so.company,
 					"posting_date": nowdate(),
 					"currency": so.currency,
-					"selling_price_list": so.selling_price_list,
+					# No price list: the invoice must inherit the delivery note's
+					# amounts, never re-price a zero/discounted line.
 					"ignore_pricing_rule": 1,
 					"custom_courier": POSTEX_COURIER,
 					"custom_postex_account": config.name,
@@ -302,14 +304,20 @@ def _create_invoices(config, result, limit):
 			# Sales Order item, which is the correct source anyway.
 			income_by_so_item = {item.name: item.get("income_account") for item in so.items}
 			for dn_item in dn.items:
+				qty = flt(dn_item.qty)
+				amount = dn_item.get("net_amount") or dn_item.amount
+				rate = net_rate(amount, qty)
 				si.append(
 					"items",
 					{
 						"item_code": dn_item.item_code,
 						"item_name": dn_item.item_name,
 						"description": dn_item.description,
-						"qty": dn_item.qty,
-						"rate": dn_item.rate,
+						"qty": qty,
+						"rate": rate,
+						"price_list_rate": rate,
+						"discount_percentage": 0,
+						"discount_amount": 0,
 						"uom": dn_item.uom,
 						"stock_uom": dn_item.stock_uom,
 						"conversion_factor": dn_item.conversion_factor,
@@ -338,7 +346,20 @@ def _create_invoices(config, result, limit):
 					},
 				)
 
-			submit(si)
+			si.flags.ignore_permissions = True
+			si.insert(ignore_permissions=True)
+
+			# Last line of defence: never post an invoice that disagrees with the
+			# delivery it bills (a re-priced or discounted line would show up here).
+			expected = flt(dn.grand_total)
+			if abs(flt(si.grand_total) - expected) > 0.01:
+				si.delete()
+				raise ValueError(
+					f"invoice total {si.grand_total} differs from delivery note "
+					f"{dn.grand_total}; not posted"
+				)
+
+			si.submit()
 			if not _claim_field("Sales Order", so.name, "custom_postex_sales_invoice", si.name):
 				_cancel_and_drop(si)
 				result["failed"].append(f"{so.name}: duplicate invoice prevented")
