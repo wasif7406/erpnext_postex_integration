@@ -161,6 +161,25 @@ def migrate_legacy_settings(company=None):
 	return import_legacy_settings(company=company)
 
 
+@frappe.whitelist()
+def health():
+	"""Which code is this site actually running? (deploy verification)"""
+	import postex_integration as package
+
+	from .constants import BUILD
+
+	return {
+		"app": "postex_integration",
+		"version": package.__version__,
+		"build": BUILD,
+		"features": {
+			"delivery_income_account_fix": True,
+			"settlement_outstanding_cap": True,
+			"track_order_skips_other_couriers": True,
+		},
+	}
+
+
 # ---------------------------------------------------------------------------
 def _resolve_accounts(account, company):
 	if account:

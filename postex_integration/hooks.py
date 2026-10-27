@@ -4,7 +4,7 @@ app_publisher = "Aqreno Nova"
 app_description = "Multi-company, multi-account PostEx courier integration"
 app_email = "dev@aqrenonova.com"
 app_license = "mit"
-app_version = "0.1.0"
+app_version = "0.1.1"
 
 required_apps = ["erpnext"]
 
