@@ -13,6 +13,7 @@ from frappe.utils import flt, nowdate
 from .config import AccountConfig
 from .constants import (
 	MAX_DOCS_PER_HELPER,
+	PAYMENT_NOT_DUE,
 	PAYMENT_NOT_PAID,
 	PICKUP_STATUSES,
 	POSTEX_COURIER,
@@ -278,6 +279,10 @@ def _create_invoices(config, result, limit):
 				result["failed"].append(f"{order.name}: delivery note not submitted")
 				continue
 
+			# A zero-value invoice has nothing for the courier to remit.
+			pay_status = (
+				PAYMENT_NOT_DUE if flt(dn.grand_total) <= 0 else PAYMENT_NOT_PAID
+			)
 			si = frappe.get_doc(
 				{
 					"doctype": "Sales Invoice",
@@ -293,7 +298,7 @@ def _create_invoices(config, result, limit):
 					"custom_postex_account": config.name,
 					"custom_postex_tracking_number": so.get("custom_postex_tracking_number"),
 					"custom_postex_status": "Delivered",
-					"custom_courier_payment_status": PAYMENT_NOT_PAID,
+					"custom_courier_payment_status": pay_status,
 					"custom_postex_delivery_fee": flt(so.get("custom_postex_delivery_fee")),
 					"custom_postex_delivery_tax": flt(so.get("custom_postex_delivery_tax")),
 					"remarks": f"COD - PostEx {so.get('shopify_order_number') or so.name} delivered, "

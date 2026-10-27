@@ -6,7 +6,7 @@ Anything that can differ per company or per merchant account belongs in
 
 # Bumped whenever we need to prove which code a site is actually running; call
 # `postex_integration.api.health` after a deploy and compare.
-BUILD = "2026-10-28.1"
+BUILD = "2026-10-28.2"
 
 POSTEX_COURIER = "PostEx"
 DEFAULT_BASE_URL = "https://api.postex.pk"
