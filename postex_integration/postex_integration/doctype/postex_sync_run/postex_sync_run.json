@@ -1,0 +1,156 @@
+{
+ "actions": [],
+ "autoname": "format:PXSR-{YYYY}-{#####}",
+ "creation": "2026-10-26 14:00:00.000000",
+ "description": "One row per sync run per PostEx account. Pruned after 90 days.",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "postex_account",
+  "company",
+  "status",
+  "column_break_main",
+  "started_on",
+  "finished_on",
+  "section_break_counts",
+  "orders_seen",
+  "refs_found",
+  "tracking_filled",
+  "status_changed",
+  "column_break_counts",
+  "booked",
+  "errors",
+  "section_break_summary",
+  "summary"
+ ],
+ "fields": [
+  {
+   "fieldname": "postex_account",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "PostEx Account",
+   "options": "PostEx Account",
+   "reqd": 1
+  },
+  {
+   "fieldname": "company",
+   "fieldtype": "Link",
+   "in_standard_filter": 1,
+   "label": "Company",
+   "options": "Company",
+   "read_only": 1
+  },
+  {
+   "fieldname": "status",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Status",
+   "options": "\nRunning\nSuccess\nPartial\nFailed\nSkipped",
+   "read_only": 1
+  },
+  {
+   "fieldname": "column_break_main",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "started_on",
+   "fieldtype": "Datetime",
+   "in_list_view": 1,
+   "label": "Started On",
+   "read_only": 1
+  },
+  {
+   "fieldname": "finished_on",
+   "fieldtype": "Datetime",
+   "label": "Finished On",
+   "read_only": 1
+  },
+  {
+   "fieldname": "section_break_counts",
+   "fieldtype": "Section Break"
+  },
+  {
+   "fieldname": "orders_seen",
+   "fieldtype": "Int",
+   "label": "Orders Seen",
+   "read_only": 1
+  },
+  {
+   "fieldname": "refs_found",
+   "fieldtype": "Int",
+   "label": "PostEx Refs Found",
+   "read_only": 1
+  },
+  {
+   "fieldname": "tracking_filled",
+   "fieldtype": "Int",
+   "label": "Tracking Filled",
+   "read_only": 1
+  },
+  {
+   "fieldname": "status_changed",
+   "fieldtype": "Int",
+   "label": "Statuses Changed",
+   "read_only": 1
+  },
+  {
+   "fieldname": "column_break_counts",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "booked",
+   "fieldtype": "Int",
+   "label": "Auto Booked",
+   "read_only": 1
+  },
+  {
+   "fieldname": "errors",
+   "fieldtype": "Int",
+   "label": "Errors",
+   "read_only": 1
+  },
+  {
+   "fieldname": "section_break_summary",
+   "fieldtype": "Section Break"
+  },
+  {
+   "fieldname": "summary",
+   "fieldtype": "Small Text",
+   "label": "Summary",
+   "read_only": 1
+  }
+ ],
+ "index_web_pages_for_search": 0,
+ "links": [],
+ "modified": "2026-10-26 14:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "PostEx Integration",
+ "name": "PostEx Sync Run",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 1
+  },
+  {
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "Accounts Manager"
+  }
+ ],
+ "sort_field": "started_on",
+ "sort_order": "DESC",
+ "states": [],
+ "track_changes": 0
+}

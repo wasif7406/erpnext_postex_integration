@@ -1,0 +1,228 @@
+{
+ "actions": [],
+ "autoname": "format:PEX-ACC-{####}",
+ "creation": "2026-10-26 14:00:00.000000",
+ "description": "One PostEx merchant account (token, pickup address, money). A company can have several; exactly one may be the default.",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "account_name",
+  "company",
+  "is_default",
+  "enabled",
+  "column_break_main",
+  "merchant_name",
+  "enable_sync",
+  "enable_auto_booking",
+  "dry_run",
+  "section_break_api",
+  "base_url",
+  "api_token",
+  "webhook_secret",
+  "column_break_api",
+  "withholding_percent",
+  "sync_window_days",
+  "last_sync_on",
+  "last_run_result",
+  "section_break_booking",
+  "pickup_address",
+  "pickup_city",
+  "column_break_booking",
+  "default_order_detail",
+  "default_weight",
+  "section_break_mapping",
+  "mapping"
+ ],
+ "fields": [
+  {
+   "fieldname": "account_name",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Account Name",
+   "reqd": 1
+  },
+  {
+   "fieldname": "company",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Company",
+   "options": "Company",
+   "reqd": 1
+  },
+  {
+   "default": "1",
+   "fieldname": "is_default",
+   "fieldtype": "Check",
+   "label": "Default for Company"
+  },
+  {
+   "default": "1",
+   "fieldname": "enabled",
+   "fieldtype": "Check",
+   "in_list_view": 1,
+   "label": "Enabled"
+  },
+  {
+   "fieldname": "column_break_main",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "merchant_name",
+   "fieldtype": "Data",
+   "label": "Merchant Name (informational)"
+  },
+  {
+   "default": "1",
+   "fieldname": "enable_sync",
+   "fieldtype": "Check",
+   "label": "Enable Status Sync"
+  },
+  {
+   "default": "0",
+   "description": "Create a PostEx booking automatically when a Sales Order is submitted. Off by default: enable only when ERPNext is the system that books.",
+   "fieldname": "enable_auto_booking",
+   "fieldtype": "Check",
+   "label": "Enable Auto Booking"
+  },
+  {
+   "default": "0",
+   "description": "Shadow mode: sync tracking/status/fees, but create no stock entries, invoices or accounting documents.",
+   "fieldname": "dry_run",
+   "fieldtype": "Check",
+   "label": "Dry Run (status only)"
+  },
+  {
+   "fieldname": "section_break_api",
+   "fieldtype": "Section Break",
+   "label": "API"
+  },
+  {
+   "default": "https://api.postex.pk",
+   "fieldname": "base_url",
+   "fieldtype": "Data",
+   "label": "Base URL"
+  },
+  {
+   "fieldname": "api_token",
+   "fieldtype": "Password",
+   "label": "API Token"
+  },
+  {
+   "description": "Used by /api/method/postex_integration.webhook.receive/<account>/<secret>",
+   "fieldname": "webhook_secret",
+   "fieldtype": "Password",
+   "label": "Webhook Secret"
+  },
+  {
+   "fieldname": "column_break_api",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "4",
+   "description": "Advance tax PostEx withholds on the COD total (2% ITWH + 2% STWH = 4%).",
+   "fieldname": "withholding_percent",
+   "fieldtype": "Float",
+   "label": "Withholding %"
+  },
+  {
+   "default": "60",
+   "description": "How many days back get-all-order is queried. Older orders are refreshed one-by-one via track-order.",
+   "fieldname": "sync_window_days",
+   "fieldtype": "Int",
+   "label": "Sync Window (days)"
+  },
+  {
+   "fieldname": "last_sync_on",
+   "fieldtype": "Datetime",
+   "label": "Last Sync On",
+   "read_only": 1
+  },
+  {
+   "fieldname": "last_run_result",
+   "fieldtype": "Small Text",
+   "label": "Last Run Result",
+   "read_only": 1
+  },
+  {
+   "fieldname": "section_break_booking",
+   "fieldtype": "Section Break",
+   "label": "Booking Defaults"
+  },
+  {
+   "fieldname": "pickup_address",
+   "fieldtype": "Small Text",
+   "label": "Pickup Address"
+  },
+  {
+   "fieldname": "pickup_city",
+   "fieldtype": "Data",
+   "label": "Pickup City"
+  },
+  {
+   "fieldname": "column_break_booking",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "default_order_detail",
+   "fieldtype": "Data",
+   "label": "Default Order Detail"
+  },
+  {
+   "default": "0.5",
+   "fieldname": "default_weight",
+   "fieldtype": "Float",
+   "label": "Default Weight (kg)"
+  },
+  {
+   "fieldname": "section_break_mapping",
+   "fieldtype": "Section Break",
+   "label": "Account Mapping"
+  },
+  {
+   "fieldname": "mapping",
+   "fieldtype": "Table",
+   "label": "Mapping",
+   "options": "PostEx Account Mapping"
+  }
+ ],
+ "index_web_pages_for_search": 0,
+ "links": [],
+ "modified": "2026-10-26 14:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "PostEx Integration",
+ "name": "PostEx Account",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "import": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  },
+  {
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "Accounts Manager",
+   "share": 1
+  }
+ ],
+ "quick_entry": 0,
+ "search_fields": "account_name,company,merchant_name",
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "title_field": "account_name",
+ "track_changes": 1
+}
