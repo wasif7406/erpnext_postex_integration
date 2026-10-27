@@ -40,9 +40,17 @@ def after_install():
 
 
 def after_migrate():
-	from .fields import ensure_custom_fields
+	"""Never let field provisioning abort a migrate."""
+	try:
+		from .fields import ensure_custom_fields
 
-	ensure_custom_fields()
+		ensure_custom_fields()
+		frappe.clear_cache()
+	except Exception:
+		frappe.log_error(
+			title="PostEx: after_migrate failed",
+			message=frappe.get_traceback(),
+		)
 
 
 # ---------------------------------------------------------------------------
