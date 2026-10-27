@@ -59,6 +59,7 @@ def reconcile_account(account: str, limit: int = MAX_PAYMENT_STATUS_CALLS) -> di
 		"settled": 0,
 		"charges_entries": [],
 		"payments": [],
+		"already_settled": [],
 		"failed": [],
 	}
 
@@ -162,8 +163,25 @@ def _book_charges(config: AccountConfig, order, invoice, settled_on, tracking, r
 
 	total = flt(invoice.grand_total)
 	withholding = flt(total * flt(config.withholding_percent) / 100.0, 2) if total else 0.0
-	if charges <= 0 and withholding <= 0:
+	net = flt(charges + withholding, 2)
+	if net <= 0:
 		return invoice
+
+	# Zero outstanding means the receivable is already cleared (a Payment Entry or
+	# a journal entry booked it earlier, e.g. the historical rework). Booking the
+	# fee against such an invoice fails ERPNext's "cannot be greater than
+	# outstanding" check and would double-book a cost that is already recognised,
+	# so treat the order as settled and leave its history alone.
+	outstanding = flt(invoice.outstanding_amount)
+	if outstanding <= 0:
+		result["already_settled"].append(order.name)
+		return invoice
+
+	# Never credit the receivable by more than what is still open; the remainder
+	# (small invoice, large courier fee) goes to the courier wallet, which is how
+	# the historical import booked those cases.
+	to_debtors = min(net, outstanding)
+	excess = flt(net - to_debtors, 2)
 
 	je = frappe.get_doc(
 		{
@@ -197,7 +215,7 @@ def _book_charges(config: AccountConfig, order, invoice, settled_on, tracking, r
 		"accounts",
 		{
 			"account": config.debtors,
-			"credit_in_account_currency": charges + withholding,
+			"credit_in_account_currency": to_debtors,
 			"party_type": "Customer",
 			"party": order.customer,
 			"reference_type": "Sales Invoice",
@@ -205,6 +223,15 @@ def _book_charges(config: AccountConfig, order, invoice, settled_on, tracking, r
 			"cost_center": config.cost_center,
 		},
 	)
+	if excess > 0:
+		je.append(
+			"accounts",
+			{
+				"account": config.finance,
+				"credit_in_account_currency": excess,
+				"cost_center": config.cost_center,
+			},
+		)
 
 	try:
 		je.insert(ignore_permissions=True)
