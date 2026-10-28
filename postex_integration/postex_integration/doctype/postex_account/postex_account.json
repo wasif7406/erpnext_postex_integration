@@ -107,13 +107,15 @@
   {
    "fieldname": "api_token",
    "fieldtype": "Password",
-   "label": "API Token"
+   "label": "API Token",
+   "length": 1000
   },
   {
    "description": "Used by /api/method/postex_integration.webhook.receive/<account>/<secret>",
    "fieldname": "webhook_secret",
    "fieldtype": "Password",
-   "label": "Webhook Secret"
+   "label": "Webhook Secret",
+   "length": 1000
   },
   {
    "fieldname": "column_break_api",
@@ -189,7 +191,7 @@
  ],
  "index_web_pages_for_search": 0,
  "links": [],
- "modified": "2026-10-26 14:00:00.000000",
+ "modified": "2026-10-28 02:00:00.000000",
  "modified_by": "Administrator",
  "module": "PostEx Integration",
  "name": "PostEx Account",
