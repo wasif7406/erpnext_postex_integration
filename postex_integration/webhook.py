@@ -11,7 +11,7 @@ import hmac
 import frappe
 
 from .constants import POSTEX_COURIER
-from .utils import dump_snippet, log_error, map_status, now
+from .utils import dump_snippet, field_exists, log_error, map_status, now
 
 LOG = "PostEx Webhook Log"
 METHOD_PATH = "/api/method/postex_integration.webhook.receive"
@@ -53,6 +53,14 @@ def receive(account=None, secret=None):
 	mapped = map_status(status_raw, history) if (status_raw or history) else ""
 	matched, result = _apply(account_doc, tracking, mapped)
 
+	frappe.db.set_value(
+		"PostEx Account",
+		account_doc.name,
+		"last_webhook_on",
+		now(),
+		update_modified=False,
+	)
+
 	try:
 		frappe.get_doc(
 			{
@@ -81,6 +89,18 @@ def receive(account=None, secret=None):
 
 # ---------------------------------------------------------------------------
 def _apply(account_doc, tracking, mapped):
+	"""Apply one webhook payload to the matching Sales Order.
+
+	Matching order (P5):
+	  1. this account + tracking (the normal case),
+	  2. tracking alone inside the company, when that order is still unassigned
+	     -> claim it (an order booked before the app existed has no account),
+	  3. tracking alone but owned by another account -> report, never overwrite:
+	     one account must never touch another account's settlement.
+
+	The webhook deliberately creates no documents (single writer rule): it only
+	updates status/tracking/courier.
+	"""
 	if not tracking:
 		return None, "no tracking number found in payload"
 
@@ -90,8 +110,6 @@ def _apply(account_doc, tracking, mapped):
 		"name",
 	)
 	if not order:
-		# The order may predate the account stamp; only accept an unassigned
-		# order of the same company, so one account can never overwrite another.
 		order = frappe.db.get_value(
 			"Sales Order",
 			{
@@ -105,6 +123,17 @@ def _apply(account_doc, tracking, mapped):
 			frappe.db.set_value("Sales Order", order, "custom_postex_account", account_doc.name)
 
 	if not order:
+		owner = frappe.db.get_value(
+			"Sales Order",
+			{"company": account_doc.company, "custom_postex_tracking_number": tracking},
+			["name", "custom_postex_account"],
+			as_dict=True,
+		)
+		if owner:
+			return owner.name, (
+				f"tracking {tracking} belongs to account {owner.custom_postex_account}, "
+				f"not {account_doc.name}"
+			)
 		return None, f"no sales order with tracking {tracking} for account {account_doc.name}"
 
 	if (frappe.db.get_value("Sales Order", order, "custom_courier") or "") != POSTEX_COURIER:
@@ -112,7 +141,10 @@ def _apply(account_doc, tracking, mapped):
 
 	old = frappe.db.get_value("Sales Order", order, "custom_postex_status")
 	if mapped and old != mapped:
-		frappe.db.set_value("Sales Order", order, "custom_postex_status", mapped)
+		values = {"custom_postex_status": mapped}
+		if field_exists("Sales Order", "custom_postex_status_changed_on"):
+			values["custom_postex_status_changed_on"] = now()
+		frappe.db.set_value("Sales Order", order, values)
 		result = f"updated: {mapped}"
 	else:
 		result = f"no change: {old} (incoming: {mapped})"
@@ -122,6 +154,7 @@ def _apply(account_doc, tracking, mapped):
 	)
 	frappe.db.commit()
 	return order, result
+
 
 
 def _find_account(value):

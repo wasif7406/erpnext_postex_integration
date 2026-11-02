@@ -6,7 +6,7 @@ Anything that can differ per company or per merchant account belongs in
 
 # Bumped whenever we need to prove which code a site is actually running; call
 # `postex_integration.api.health` after a deploy and compare.
-BUILD = "2026-10-28.3"
+BUILD = "2026-11-02.1"
 
 POSTEX_COURIER = "PostEx"
 DEFAULT_BASE_URL = "https://api.postex.pk"
@@ -108,6 +108,66 @@ PICKUP_STATUSES = (
 TERMINAL_STATUSES = ("Delivered", "Returned", "Cancelled", "Expired")
 
 # ---------------------------------------------------------------------------
+# Sync scope
+# ---------------------------------------------------------------------------
+# The scope of a sync run is decided by the order's state, never by a row
+# count. See `scope.py` for the predicate and `architecture.md` §7.2 for the
+# sizing table.
+#
+# Still moving: polled on every run.
+ACTIVE_STATUSES = (
+	"Unbooked",
+	"Booked",
+	"Picked By PostEx",
+	"En-Route to PostEx Warehouse",
+	"PostEx Warehouse",
+	"Out For Delivery",
+	"Attempted",
+	"Delivery Under Review",
+	"Out For Return",
+	"Transferred",
+)
+
+# Terminal, but only once the late-return window has closed: a parcel marked
+# Delivered can still be refused / returned by the consignee weeks later.
+LATE_RETURN_STATUSES = ("Delivered", "Returned")
+LATE_RETURN_WINDOW_DAYS = 45
+
+# Final for good. `Cancelled` / `Expired` are handled separately: they are only
+# final once the Sales Order is terminal too, because a cancelled booking can
+# be rebooked while the order is still open.
+FINAL_STATUSES = ("Lost", "Damage", "Stolen", "Un-Assigned By Me")
+
+# `Sales Order.status` values that make a Cancelled/Expired courier status final.
+CLOSED_SALES_ORDER_STATUSES = ("Closed", "Completed", "Cancelled")
+
+SCAN_ACTIVE = "Active"
+SCAN_LATE_RETURNS = "Late Returns"
+
+# ---------------------------------------------------------------------------
+# Sync pacing / cursor
+# ---------------------------------------------------------------------------
+# page size: how many orders one run looks at. Sizing (1 request/second):
+#   100 orders/day -> ~500 in flight  -> 6 per run at 96 runs/day
+#   500 orders/day -> ~2.500 in flight -> 26 per run
+#  1000 orders/day -> ~5.000 in flight -> 53 per run
+#  2000 orders/day -> ~10.000 in flight -> 105 per run
+# 200 gives 4-8x headroom up to ~2.000 orders/day. If volume outgrows that,
+# raise the page size or shorten the cron interval - never the safety ceiling.
+DEFAULT_SYNC_PAGE_SIZE = 200
+DEFAULT_REQUEST_DELAY = 1.0
+MIN_REQUEST_DELAY = 0.25
+DEFAULT_RUN_REQUEST_BUDGET = 800
+
+# An order that fails this many times in a row is quarantined
+# (`custom_postex_needs_attention`) so it stops consuming scan slots.
+MAX_SYNC_FAILURES = 5
+
+# Hard safety ceiling only: a bad query must not scan the whole table. It is
+# not a correctness mechanism (the cursor is).
+MAX_SCAN_CEILING = 2000
+
+# ---------------------------------------------------------------------------
 # Mapping roles
 # ---------------------------------------------------------------------------
 ROLE_FINANCE = "Courier Finance"
@@ -174,8 +234,8 @@ PAYMENT_NOT_DUE = "No Payment Due"
 # account (PostEx Account.withholding_percent); this is only the default.
 DEFAULT_WITHHOLDING_PERCENT = 4.0
 
-# Safety caps per run, mirroring the server-script behaviour.
-MAX_TRACK_ORDER_CALLS = 40
+# Safety caps per run, mirroring the server-script behaviour. The scan size and
+# the HTTP call budget are per account (see `PostEx Account.sync_page_size` /
+# `run_request_budget`); these remain genuinely site-wide.
 MAX_PAYMENT_STATUS_CALLS = 40
-MAX_ORDERS_PER_SYNC = 500
 MAX_DOCS_PER_HELPER = 100

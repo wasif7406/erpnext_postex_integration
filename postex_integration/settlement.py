@@ -11,7 +11,7 @@ merchant wallet (`Courier Finance` of that account).
 """
 
 import frappe
-from frappe.utils import flt, nowdate
+from frappe.utils import flt, now_datetime, nowdate
 
 from .client import PostExClient
 from .config import AccountConfig, get_account
@@ -20,7 +20,9 @@ from .constants import (
 	PAYMENT_PAID,
 )
 from .exceptions import PostExAPIError, PostExConfigError
-from .utils import log_error, today_or
+from .utils import bump_failures, clear_failures, field_exists, log_error, today_or
+
+SETTLEMENT_CURSOR = "custom_postex_payout_checked_on"
 
 
 def reconcile_all(company=None) -> dict:
@@ -37,6 +39,13 @@ def reconcile_all(company=None) -> dict:
 			log_error("PostEx settlement failed", f"{row.name}\n{frappe.get_traceback()}")
 			out["results"][row.name] = {"error": "exception"}
 	return out
+
+
+def reconcile_account_locked(account: str) -> dict:
+	"""Cron entry point: settlement under the account's settlement lock."""
+	from .tasks import run_locked
+
+	return run_locked("settle", account, reconcile_account)
 
 
 def reconcile_account(account: str, limit: int = MAX_PAYMENT_STATUS_CALLS) -> dict:
@@ -63,34 +72,35 @@ def reconcile_account(account: str, limit: int = MAX_PAYMENT_STATUS_CALLS) -> di
 		"failed": [],
 	}
 
-	orders = frappe.get_all(
-		"Sales Order",
-		filters={
-			"docstatus": 1,
-			"company": config.company,
-			"custom_postex_account": config.name,
-			"custom_postex_status": "Delivered",
-			"custom_postex_sales_invoice": ("is", "set"),
-			"custom_postex_settled_on": ("is", "not set"),
-		},
-		fields=[
-			"name",
-			"customer",
-			"company",
-			"shopify_order_number",
-			"custom_postex_tracking_number",
-			"custom_postex_sales_invoice",
-			"custom_postex_delivery_fee",
-			"custom_postex_delivery_tax",
-			"custom_postex_charges_entry",
-		],
-		limit=limit,
-		order_by="modified asc",
+	orders = frappe.db.sql(
+		f"""
+		select name, customer, company, shopify_order_number,
+		       custom_postex_tracking_number, custom_postex_sales_invoice,
+		       custom_postex_delivery_fee, custom_postex_delivery_tax,
+		       custom_postex_charges_entry
+		from `tabSales Order`
+		where docstatus = 1
+		  and company = %(company)s
+		  and custom_postex_account = %(account)s
+		  and custom_postex_status = 'Delivered'
+		  and ifnull(custom_postex_sales_invoice, '') != ''
+		  and ifnull(custom_postex_settled_on, '') = ''
+		  and ifnull(custom_postex_needs_attention, 0) = 0
+		order by {_cursor_order()}, modified asc
+		limit %(limit)s
+		""",
+		{"company": config.company, "account": config.name, "limit": int(limit)},
+		as_dict=True,
 	)
+	orders = [frappe._dict(row) for row in orders]
 
 	groups = {}
 
 	for order in orders:
+		# Settlement has its own cursor: every checked order is stamped, so a
+		# permanently failing or forever-unsettled invoice rotates to the back
+		# instead of occupying one of the 40 slots on every single run.
+		_stamp_checked(order.name)
 		tracking = (order.custom_postex_tracking_number or "").strip().replace(" ", "")
 		if not tracking:
 			continue
@@ -98,8 +108,13 @@ def reconcile_account(account: str, limit: int = MAX_PAYMENT_STATUS_CALLS) -> di
 		try:
 			dist = client.payment_status(tracking)
 		except PostExAPIError as exc:
-			result["failed"].append(f"{order.name}: {str(exc)[:90]}")
+			result["failed"].append(
+				{"sales_order": order.name, "step": "settlement", "error": str(exc)[:300]}
+			)
+			bump_failures(order.name, "settlement", str(exc))
 			continue
+		# The call worked: "not settled yet" is a healthy answer, not a failure.
+		clear_failures(order.name)
 		if not dist or not _is_true(dist.get("settle")):
 			continue
 
@@ -109,6 +124,7 @@ def reconcile_account(account: str, limit: int = MAX_PAYMENT_STATUS_CALLS) -> di
 		invoice = frappe.get_doc("Sales Invoice", order.custom_postex_sales_invoice)
 		if invoice.docstatus != 1:
 			_mark_settled_on_order(order.name, settled_on)
+			clear_failures(order.name)
 			continue
 
 		invoice = _book_charges(config, order, invoice, settled_on, tracking, result)
@@ -116,6 +132,7 @@ def reconcile_account(account: str, limit: int = MAX_PAYMENT_STATUS_CALLS) -> di
 		outstanding = flt(invoice.outstanding_amount)
 		if outstanding <= 0:
 			_mark_settled_on_order(order.name, settled_on)
+			clear_failures(order.name)
 			continue
 
 		key = (cpr, settled_on, order.customer, config.name)
@@ -243,7 +260,10 @@ def _book_charges(config: AccountConfig, order, invoice, settled_on, tracking, r
 			"Sales Invoice",
 			invoice.name,
 		)
-		result["failed"].append(f"{order.name} charges: {str(exc)[:100]}")
+		result["failed"].append(
+			{"sales_order": order.name, "step": "settlement", "error": f"charges: {str(exc)[:280]}"}
+		)
+		bump_failures(order.name, "settlement", f"charges: {exc}")
 		return invoice
 
 	frappe.db.set_value(
@@ -308,7 +328,15 @@ def _create_payment(config: AccountConfig, group, result):
 			"PostEx payout entry failed",
 			f"{group['cpr']} / {group['customer']}: {exc}\n{frappe.get_traceback()}",
 		)
-		result["failed"].append(f"payment {group['cpr']}/{group['customer']}: {str(exc)[:100]}")
+		# A payment failure is group-wide (CPR/customer), not one order's fault,
+		# so it is recorded but does not quarantine the invoices.
+		result["failed"].append(
+			{
+				"sales_order": group["orders"][0] if group["orders"] else None,
+				"step": "settlement",
+				"error": f"payment {group['cpr']}/{group['customer']}: {str(exc)[:280]}",
+			}
+		)
 		return
 
 	for sales_order in group["orders"]:
@@ -321,6 +349,7 @@ def _create_payment(config: AccountConfig, group, result):
 			},
 			update_modified=False,
 		)
+		clear_failures(sales_order)
 	for ref in group["refs"]:
 		frappe.db.set_value(
 			"Sales Invoice",
@@ -361,7 +390,13 @@ def _create_payment(config: AccountConfig, group, result):
 			)
 		frappe.db.commit()
 		result["payments"].remove(pe.name)
-		result["failed"].append(f"duplicate payment prevented {pe.name}")
+		result["failed"].append(
+			{
+				"sales_order": group["orders"][0] if group["orders"] else None,
+				"step": "settlement",
+				"error": f"duplicate payment prevented {pe.name}",
+			}
+		)
 
 
 def _mark_settled_on_order(sales_order, settled_on):
@@ -369,6 +404,25 @@ def _mark_settled_on_order(sales_order, settled_on):
 		"Sales Order", sales_order, "custom_postex_settled_on", settled_on, update_modified=False
 	)
 	frappe.db.commit()
+
+
+def _stamp_checked(sales_order):
+	if not field_exists("Sales Order", SETTLEMENT_CURSOR):
+		return
+	frappe.db.set_value(
+		"Sales Order",
+		sales_order,
+		SETTLEMENT_CURSOR,
+		now_datetime(),
+		update_modified=False,
+	)
+
+
+def _cursor_order() -> str:
+	"""Settlement cursor, or `modified` on a site that has not migrated yet."""
+	if field_exists("Sales Order", SETTLEMENT_CURSOR):
+		return f"ifnull({SETTLEMENT_CURSOR}, '1900-01-01 00:00:00')"
+	return "ifnull(modified, '1900-01-01 00:00:00')"
 
 
 def _is_true(value) -> bool:

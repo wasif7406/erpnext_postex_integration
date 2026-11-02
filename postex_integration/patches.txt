@@ -6,3 +6,4 @@ postex_integration.patches.v0_1.adopt_legacy_webhook_log
 # Patches added in this section will be executed after doctypes are migrated
 postex_integration.patches.v0_1.ensure_custom_fields
 postex_integration.patches.v0_1.allow_long_secrets
+postex_integration.patches.v0_1.seed_sync_fields

@@ -105,11 +105,16 @@ One record per company.
 | `merchant_name` | Data | informational |
 | `withholding_percent` | Float (4) | advance tax withheld by the courier |
 | `sync_window_days` | Int (60) | list window; older orders use `track-order` |
+| `sync_page_size` | Int (200) | orders scanned per run — see §7.2 |
+| `request_delay_seconds` | Float (1.0) | minimum gap between HTTP calls, floor 0.25 |
+| `run_request_budget` | Int (800) | hard cap on HTTP calls per run |
+| `digest_recipients` | Small Text | optional emails for the daily digest |
 | `pickup_address` | Small Text | booking payload |
 | `pickup_city` | Data | booking payload |
 | `default_order_detail` | Data | booking fallback |
 | `default_weight` | Float (0.5) | booking fallback |
 | `webhook_secret` | Password | per-account webhook endpoint |
+| `last_webhook_on` | Datetime | last call received; the watchdog alerts after 24 h of silence |
 | `last_sync_on` | Datetime | per company |
 | `last_run_result` | Small Text | per company log line |
 | `mapping` | Table → `PostEx Account Mapping` | financial/stock mapping |
@@ -141,6 +146,11 @@ One row per booking attempt (manual or automatic): company, sales order,
 reference number, payload hash, HTTP status, response, tracking returned,
 user, timestamp. Gives an audit trail and makes duplicate-booking analysis
 possible.
+
+`PostEx Sync Run` records one row per run, including the **Failures** child
+table (`PostEx Sync Failure`: order + step + error) and the unmatched order
+names, so "which order broke, at which step, why" is answered without opening
+the Error Log.
 
 ### 5.4 Reuse of existing custom fields
 
@@ -294,11 +304,29 @@ accounts — while still letting the user override any dropdown afterwards.
 
 Per account, in one scheduled run:
 
-1. Pull `get-all-order` with that account's token.
-2. Upsert only Sales Orders with `company == account.company`.
-3. Update tracking / status / fees / reversal fees / last synced.
-4. Optional: book missing orders when `enable_auto_booking`.
-5. Write a per-company summary into `PostEx Account.last_run_result`.
+1. Pull `get-all-order` (plus `get-unbooked-orders` as a gap-filler) with that
+   account's token — two paced requests.
+2. Select the page of eligible orders **oldest attempt first**
+   (`custom_postex_last_attempt_on`, NULL first), `sync_page_size` rows.
+   Eligibility is state-based (`scope.py`): moving statuses every run;
+   Delivered/Returned once a day for 45 days; final, other-courier, historical
+   and quarantined orders never.
+3. Match by `orderRefNumber` first (free). Only orders that already carry a
+   tracking number and were not in the feed cost a `track-order` call, and those
+   are counted against `run_request_budget` (stops cleanly when spent).
+4. Update tracking / status / status-changed timestamp / fees / courier /
+   last-synced; reset the failure counter. Stamp `last_attempt_on` on **every**
+   attempt, successful or not — that is the cursor.
+5. Optional: book missing orders when `enable_auto_booking`.
+6. Run the stock/revenue helpers for this account (not for the late-return
+   sweep).
+7. Write the run record: counts, requests, budget flag, unmatched names and a
+   Failures table (order + step + error); quarantine an order after 5
+   consecutive failures; update `last_run_result`.
+
+The settlement stream is independent: it polls `payment-status` for delivered +
+invoiced + unsettled orders with its own cursor (`custom_postex_payout_checked_on`),
+so 40 forever-unsettled invoices can no longer occupy every slot.
 
 ### 7.3 Pickup transfer
 
@@ -372,8 +400,11 @@ Server Scripts could not do (a) because `frappe.cache` is unavailable in
 
 | Job | Frequency | Notes |
 |---|---|---|
-| `sync_all_accounts` | every 15 minutes | loops enabled accounts; enqueues one background job per account |
-| `payout_reconciliation` | every 30–60 minutes | per account |
+| `sync_all_accounts` | every 15 minutes | loops enabled accounts; enqueues one locked background job per account |
+| `late_return_sweep` | daily 03:15 | Delivered/Returned inside the 45-day window (late returns) |
+| `settle_all_accounts` | every 30 minutes | per account, with its own per-order cursor |
+| `webhook_watchdog` | daily 07:00 | alerts when an account receives no webhook in 24 h |
+| `daily_digest` | daily 08:30 | coverage, unmatched, quarantine, documents, cash expected vs received |
 | `booking_sweep` | hourly | optional catch-up when auto-booking is on |
 
 Each job:
@@ -420,6 +451,8 @@ Existing query reports keep working but need a `company` filter:
 | `Courier Payment Summary` | group by Company, Courier, Payment status |
 | `Approx Settled Invoices` | add Company |
 | `Orders Without Courier` / `Invoices Without Courier` | add Company |
+| **`PostEx Unmatched Orders`** (shipped) | PostEx orders with no record, grouped by reason — the read-only worklist |
+| **`PostEx Payout Ageing`** (shipped) | delivered + invoiced + unsettled, bucketed 0-7 / 8-14 / 15-30 / 30+ days |
 | new: `PostEx Wallet by Company` | wallet balance vs statement per account |
 | new: `PostEx Settlement Reconciliation` | CPR × invoice × fee × withholding |
 

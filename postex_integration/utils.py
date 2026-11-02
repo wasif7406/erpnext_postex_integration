@@ -93,6 +93,50 @@ def set_values(doctype: str, name: str, values: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Per-order failure tracking (quarantine)
+# ---------------------------------------------------------------------------
+def bump_failures(sales_order: str, step: str | None = None, error: str | None = None) -> int:
+	"""Count one more consecutive failure for an order.
+
+	After `MAX_SYNC_FAILURES` in a row the order is quarantined
+	(`custom_postex_needs_attention`), which every automatic sweep skips until a
+	human re-queues it — that is what stops a permanently broken order from
+	consuming a scan slot forever.
+	"""
+	from .constants import MAX_SYNC_FAILURES
+
+	if not field_exists("Sales Order", "custom_postex_sync_failures"):
+		return 0
+
+	current = int(frappe.db.get_value("Sales Order", sales_order, "custom_postex_sync_failures") or 0) + 1
+	values = {"custom_postex_sync_failures": current}
+	if current >= MAX_SYNC_FAILURES:
+		values["custom_postex_needs_attention"] = 1
+	frappe.db.set_value("Sales Order", sales_order, values, update_modified=False)
+	if step:
+		log_error(
+			f"PostEx {step} failed",
+			f"{sales_order}\n{(error or '')[:500]}",
+			"Sales Order",
+			sales_order,
+		)
+	return current
+
+
+def clear_failures(sales_order: str) -> None:
+	"""Reset the consecutive-failure counter after a successful step."""
+	if not field_exists("Sales Order", "custom_postex_sync_failures"):
+		return
+	frappe.db.set_value(
+		"Sales Order",
+		sales_order,
+		{"custom_postex_sync_failures": 0, "custom_postex_needs_attention": 0},
+		update_modified=False,
+	)
+
+
+
+# ---------------------------------------------------------------------------
 # Document helpers
 # ---------------------------------------------------------------------------
 def submit(doc, ignore_permissions: bool = True):

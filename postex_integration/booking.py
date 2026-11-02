@@ -147,6 +147,26 @@ def on_sales_order_submit(doc, method=None):
 		)
 
 
+def ensure_po_no(doc, method=None):
+	"""Mirror the Shopify order name into `po_no`.
+
+	The Shopify connector writes `shopify_order_number` only; every importer,
+	report and matching script on this site looks at `po_no`. When the two drift
+	apart the same sale gets a second Sales Order (31-10 / 01-11 duplication of
+	VM5347, VM5350, VM5353, VM5354, VM5356), because a `po_no` lookup finds
+	nothing and a new document is created.
+
+	Filling `po_no` from `shopify_order_number` at insert/save time keeps both
+	keys in step, so a match on either one finds the same order. Never
+	overwrites an existing `po_no`.
+	"""
+	if (doc.get("po_no") or "").strip():
+		return
+	shopify_name = (doc.get("shopify_order_number") or "").strip()
+	if shopify_name:
+		doc.po_no = shopify_name
+
+
 def validate_account_change(doc, method=None):
 	"""Keep `custom_postex_account` consistent with the document.
 

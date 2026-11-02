@@ -3,21 +3,166 @@
 //  * PostEx Account is selectable, filtered to the order's company
 //  * "Create PostEx Booking" asks which account to use when the company has more
 //    than one enabled PostEx account
+//  * "Fetch PostEx Status" pulls the live status of this one parcel from PostEx
+//    (only for PostEx orders that already carry a tracking number)
 frappe.ui.form.on("Sales Order", {
 	refresh(frm) {
 		toggle_courier_fields(frm);
 		set_account_query(frm);
 		bind_booking_button(frm);
+		bind_fetch_button(frm);
+		add_order_actions(frm);
+		show_quarantine(frm);
 	},
 	custom_courier(frm) {
 		toggle_courier_fields(frm);
 		bind_booking_button(frm);
+		bind_fetch_button(frm);
+		add_order_actions(frm);
 	},
 	company(frm) {
 		set_account_query(frm);
 		clear_account_if_other_company(frm);
 	},
 });
+
+// ---------------------------------------------------------------------------
+// Quarantine + manual re-sync (P7/P8)
+// ---------------------------------------------------------------------------
+function show_quarantine(frm) {
+	if (!frm.doc.custom_postex_needs_attention) return;
+	frm.set_intro(
+		__(
+			"Quarantined after {0} consecutive sync failures: this order is skipped by every automatic sweep. Fix the cause, then press 'Re-queue for sync'.",
+			[frm.doc.custom_postex_sync_failures || 5]
+		),
+		"red"
+	);
+}
+
+function add_order_actions(frm) {
+	frm.remove_custom_button(__("Fetch PostEx Status"), __("PostEx"));
+	frm.remove_custom_button(__("Re-queue for sync"), __("PostEx"));
+	if (frm.doc.docstatus !== 1) return;
+
+	// Fallback for sites where the Button field has not been migrated in yet.
+	if (
+		!frm.fields_dict.custom_fetch_postex_status &&
+		frm.doc.custom_courier === "PostEx" &&
+		frm.doc.custom_postex_tracking_number
+	) {
+		frm.add_custom_button(
+			__("Fetch PostEx Status"),
+			() => fetch_postex_status(frm),
+			__("PostEx")
+		);
+	}
+
+	if (frm.doc.custom_postex_needs_attention || (frm.doc.custom_postex_sync_failures || 0) > 0) {
+		frm.add_custom_button(
+			__("Re-queue for sync"),
+			() => {
+				frappe.confirm(
+					__("Clear the failure counter and put this order back in the automatic sync?"),
+					() => {
+						frappe.call({
+							method: "postex_integration.api.requeue_order",
+							args: { sales_order: frm.doc.name },
+							callback: () => {
+								frappe.show_alert({
+									message: __("Re-queued for the next sync run."),
+									indicator: "green",
+								});
+								frm.reload_doc();
+							},
+						});
+					}
+				);
+			},
+			__("PostEx")
+		);
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Manual status fetch (Courier Detail > "Fetch PostEx Status")
+// ---------------------------------------------------------------------------
+function bind_fetch_button(frm) {
+	const field = frm.fields_dict.custom_fetch_postex_status;
+	if (!field || !field.$input) return;
+	field.$input.off("click").on("click", function () {
+		fetch_postex_status(frm);
+	});
+}
+
+function fetch_postex_status(frm) {
+	if (frm.doc.custom_courier !== "PostEx") {
+		frappe.msgprint({
+			title: __("Not a PostEx order"),
+			message: __("Courier Issued is {0}; only PostEx orders can be fetched.", [
+				frappe.utils.escape_html(frm.doc.custom_courier || __("empty")),
+			]),
+			indicator: "orange",
+		});
+		return;
+	}
+	if (!frm.doc.custom_postex_tracking_number) {
+		frappe.msgprint({
+			title: __("Not booked yet"),
+			message: __(
+				"This order has no PostEx tracking number yet. Create the booking first, then fetch its status."
+			),
+			indicator: "orange",
+		});
+		return;
+	}
+
+	frappe.call({
+		method: "postex_integration.api.resync_order",
+		args: { sales_order: frm.doc.name },
+		freeze: true,
+		freeze_message: __("Asking PostEx for this parcel..."),
+		callback: (r) => {
+			const res = r.message || {};
+			if (!res.ok) {
+				frappe.msgprint({
+					title: __("Status not available"),
+					message: frappe.utils.escape_html(res.error || __("Unknown error")),
+					indicator: "red",
+				});
+				return;
+			}
+
+			const status = res.status || __("unknown");
+			const lines = [];
+			if (res.changed && res.previous_status) {
+				lines.push(
+					__("Status: {0} (was {1})", [status, res.previous_status])
+				);
+			} else {
+				lines.push(__("Status: {0} (unchanged)", [status]));
+			}
+			if (res.postex_status && res.postex_status !== status) {
+				lines.push(__("PostEx reports: {0}", [res.postex_status]));
+			}
+			if (res.tracking) lines.push(__("Tracking: {0}", [res.tracking]));
+			if (res.delivery_fee) {
+				lines.push(__("Courier fee: {0}", [format_currency(res.delivery_fee)]));
+			}
+			if (res.last_synced_on) {
+				lines.push(__("Fetched: {0}", [res.last_synced_on]));
+			}
+			if (res.next_step) lines.push(res.next_step);
+
+			frappe.msgprint({
+				title: __("PostEx status"),
+				message: lines.map((line) => frappe.utils.escape_html(line)).join("<br>"),
+				indicator: res.changed ? "green" : "blue",
+			});
+			frm.reload_doc();
+		},
+	});
+}
 
 function clear_account_if_other_company(frm) {
 	const account = frm.doc.custom_postex_account;
@@ -78,6 +223,14 @@ function toggle_courier_fields(frm) {
 		!frm.doc.custom_postex_tracking_number && (courier === "" || courier === "PostEx");
 	if (frm.fields_dict.custom_create_postex_booking) {
 		frm.toggle_display("custom_create_postex_booking", show_button);
+	}
+
+	// "Fetch PostEx Status" complements the booking button: it only makes sense
+	// once the parcel exists at PostEx (tracking number) and this is a PostEx
+	// order, so no other courier is ever polled.
+	const show_fetch = courier === "PostEx" && !!frm.doc.custom_postex_tracking_number;
+	if (frm.fields_dict.custom_fetch_postex_status) {
+		frm.toggle_display("custom_fetch_postex_status", show_fetch);
 	}
 }
 

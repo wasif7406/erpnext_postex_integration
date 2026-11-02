@@ -4,7 +4,7 @@ app_publisher = "Aqreno Nova"
 app_description = "Multi-company, multi-account PostEx courier integration"
 app_email = "dev@aqrenonova.com"
 app_license = "mit"
-app_version = "0.1.1"
+app_version = "0.2.0"
 
 required_apps = ["erpnext"]
 
@@ -31,7 +31,10 @@ after_migrate = "postex_integration.install.after_migrate"
 # ---------------------------------------------------------------------------
 doc_events = {
 	"Sales Order": {
-		"validate": "postex_integration.booking.validate_account_change",
+		"validate": [
+			"postex_integration.booking.ensure_po_no",
+			"postex_integration.booking.validate_account_change",
+		],
 		"on_submit": "postex_integration.booking.on_sales_order_submit",
 	}
 }
@@ -49,6 +52,17 @@ scheduler_events = {
 		],
 		"*/30 * * * *": [
 			"postex_integration.tasks.settle_all_accounts",
+		],
+		# Delivered/Returned are re-checked once a day for 45 days (late returns),
+		# then never again. Deliberately separate from the 15-minute poll.
+		"15 3 * * *": [
+			"postex_integration.tasks.late_return_sweep",
+		],
+		"0 7 * * *": [
+			"postex_integration.tasks.webhook_watchdog",
+		],
+		"30 8 * * *": [
+			"postex_integration.tasks.daily_digest",
 		],
 	},
 	"daily": [

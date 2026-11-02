@@ -23,8 +23,15 @@
   "column_break_api",
   "withholding_percent",
   "sync_window_days",
+  "last_webhook_on",
   "last_sync_on",
   "last_run_result",
+  "section_break_sync",
+  "sync_page_size",
+  "request_delay_seconds",
+  "run_request_budget",
+  "column_break_sync",
+  "digest_recipients",
   "section_break_booking",
   "pickup_address",
   "pickup_city",
@@ -136,6 +143,13 @@
    "label": "Sync Window (days)"
   },
   {
+   "description": "Last webhook call received for this account. The hourly watchdog alerts when it is older than 24 hours while sync is enabled.",
+   "fieldname": "last_webhook_on",
+   "fieldtype": "Datetime",
+   "label": "Last Webhook On",
+   "read_only": 1
+  },
+  {
    "fieldname": "last_sync_on",
    "fieldtype": "Datetime",
    "label": "Last Sync On",
@@ -146,6 +160,42 @@
    "fieldtype": "Small Text",
    "label": "Last Run Result",
    "read_only": 1
+  },
+  {
+   "fieldname": "section_break_sync",
+   "fieldtype": "Section Break",
+   "label": "Sync Pacing"
+  },
+  {
+   "default": "200",
+   "description": "Orders scanned per run. 200 covers up to ~2.000 orders/day at 1 request/second (96 runs/day). If volume grows, raise this or shorten the cron interval - never the safety ceiling in constants.py.",
+   "fieldname": "sync_page_size",
+   "fieldtype": "Int",
+   "label": "Orders Per Run"
+  },
+  {
+   "default": "1.0",
+   "description": "Minimum seconds between two HTTP requests (floor 0.25). PostEx's published limit is about 1 request/second.",
+   "fieldname": "request_delay_seconds",
+   "fieldtype": "Float",
+   "label": "Request Delay (seconds)"
+  },
+  {
+   "default": "800",
+   "description": "Hard cap on HTTP calls per run. When it is hit the run stops cleanly and the cursor keeps the rest for the next run.",
+   "fieldname": "run_request_budget",
+   "fieldtype": "Int",
+   "label": "Requests Per Run"
+  },
+  {
+   "fieldname": "column_break_sync",
+   "fieldtype": "Column Break"
+  },
+  {
+   "description": "Comma-separated email addresses for the daily digest. Leave empty to only log it as a desk notification.",
+   "fieldname": "digest_recipients",
+   "fieldtype": "Small Text",
+   "label": "Daily Digest Recipients"
   },
   {
    "fieldname": "section_break_booking",
@@ -191,7 +241,7 @@
  ],
  "index_web_pages_for_search": 0,
  "links": [],
- "modified": "2026-10-28 02:00:00.000000",
+ "modified": "2026-11-02 10:00:00.000000",
  "modified_by": "Administrator",
  "module": "PostEx Integration",
  "name": "PostEx Account",

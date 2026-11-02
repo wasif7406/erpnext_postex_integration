@@ -5,10 +5,16 @@ Policy (unchanged from the single-company implementation):
   * delivered  : In-Transit -> customer (Delivery Note), then Sales Invoice
   * returned   : In-Transit -> Stores (Material Transfer) + courier cost
   * a returned order has no invoice at all (delivered => invoice only)
+
+Every creator is guarded twice: the query only selects orders that are still
+missing the document, and the loop re-checks the Sales Order before creating
+anything (an invoice from any source, a fully delivered order, a quarantine
+flag). Running the helpers twice in a row therefore creates nothing the second
+time. Verify-after-create still protects against two concurrent runs.
 """
 
 import frappe
-from frappe.utils import flt, nowdate
+from frappe.utils import cint, flt, nowdate
 
 from .config import AccountConfig
 from .constants import (
@@ -18,7 +24,14 @@ from .constants import (
 	PICKUP_STATUSES,
 	POSTEX_COURIER,
 )
-from .utils import exclude_historical, log_error, net_rate, submit
+from .utils import (
+	bump_failures,
+	clear_failures,
+	exclude_historical,
+	log_error,
+	net_rate,
+	submit,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -30,6 +43,8 @@ def _base_filters(config: AccountConfig) -> dict:
 	The courier itself is checked in Python after loading the document: an empty
 	Select is stored as NULL, and `IN ('', 'PostEx')` never matches NULL, so a
 	SQL filter here would silently skip every order whose courier is still blank.
+	The same applies to the `custom_postex_needs_attention` Check, which is NULL
+	on rows created before the field existed.
 	"""
 	return {
 		"docstatus": 1,
@@ -42,11 +57,24 @@ def _courier_is_ours(doc) -> bool:
 	return (doc.get("custom_courier") or "") in ("", POSTEX_COURIER)
 
 
+def _is_quarantined(doc) -> bool:
+	return bool(cint(doc.get("custom_postex_needs_attention")))
+
+
+def _skip_order(doc) -> bool:
+	"""One place for the two Python-side guards."""
+	return _is_quarantined(doc) or not _courier_is_ours(doc)
+
+
 def _pickup_submitted(order) -> bool:
 	entry = order.get("custom_postex_pickup_entry")
 	if not entry:
 		return False
 	return frappe.db.get_value("Stock Entry", entry, "docstatus") == 1
+
+
+def _fully_delivered(so) -> bool:
+	return flt(so.get("per_delivered")) >= 100
 
 
 def _pending_rows(so):
@@ -56,6 +84,42 @@ def _pending_rows(so):
 		if qty > 0:
 			rows.append((item, qty))
 	return rows
+
+
+def _existing_invoice(sales_order):
+	"""Any submitted-or-draft sales invoice (not a credit note) for this order.
+
+	Checked through `Sales Invoice Item.sales_order`, so an invoice created
+	outside the app (or by an older integration) also counts. A cancelled
+	invoice (docstatus 2) and a credit note (`Sales Invoice.is_return`) do not.
+	"""
+	rows = frappe.db.sql(
+		"""
+		select sii.parent
+		from `tabSales Invoice Item` sii
+		join `tabSales Invoice` si on si.name = sii.parent
+		where sii.sales_order = %s
+		  and sii.docstatus != 2
+		  and ifnull(si.is_return, 0) = 0
+		order by si.posting_date desc, si.name desc
+		limit 1
+		""",
+		(sales_order,),
+	)
+	return rows[0][0] if rows else None
+
+
+def _fail(result, sales_order, step, message, reference=None):
+	"""Record a failure and make it count towards quarantine."""
+	bump_failures(sales_order, step=step, error=message)
+	result["failed"].append(
+		{
+			"sales_order": sales_order,
+			"step": step,
+			"reference": reference,
+			"error": (message or "")[:500],
+		}
+	)
 
 
 def _claim_field(doctype, name, fieldname, value) -> bool:
@@ -94,6 +158,8 @@ def pickup_transfer(config: AccountConfig, limit: int = MAX_DOCS_PER_HELPER) -> 
 		{
 			"custom_postex_pickup_entry": ("is", "not set"),
 			"custom_postex_status": ("in", list(PICKUP_STATUSES)),
+			# Stock that already left through a delivery must never move twice.
+			"per_delivered": ("<", 100),
 		}
 	)
 	filters.update(exclude_historical())
@@ -101,15 +167,19 @@ def pickup_transfer(config: AccountConfig, limit: int = MAX_DOCS_PER_HELPER) -> 
 	orders = frappe.get_all(
 		"Sales Order",
 		filters=filters,
-		fields=["name", "set_warehouse"],
+		fields=["name", "set_warehouse", "per_delivered"],
 		limit=limit,
 		order_by="modified desc",
 	)
 
 	for order in orders:
 		try:
+			if flt(order.get("per_delivered")) >= 100:
+				# Stock already left through a delivery: never move it twice.
+				result["skipped"] += 1
+				continue
 			so = frappe.get_doc("Sales Order", order.name)
-			if not _courier_is_ours(so):
+			if _skip_order(so):
 				result["skipped"] += 1
 				continue
 			rows = []
@@ -152,14 +222,21 @@ def pickup_transfer(config: AccountConfig, limit: int = MAX_DOCS_PER_HELPER) -> 
 
 			if not _claim_field("Sales Order", so.name, "custom_postex_pickup_entry", se.name):
 				_cancel_and_drop(se)
-				result["failed"].append(f"{so.name}: duplicate pickup transfer prevented")
+				_fail(
+					result,
+					so.name,
+					"pickup",
+					"duplicate pickup transfer prevented",
+					so.get("custom_postex_tracking_number"),
+				)
 				continue
 
+			clear_failures(so.name)
 			result["created"].append(f"{so.name}={se.name}")
 			frappe.db.commit()
 		except Exception as exc:
 			log_error("PostEx pickup transfer failed", f"{order.name}: {exc}", "Sales Order", order.name)
-			result["failed"].append(f"{order.name}: {str(exc)[:120]}")
+			_fail(result, order.name, "pickup", str(exc)[:120])
 
 	frappe.db.commit()
 	return result
@@ -172,6 +249,7 @@ def delivery_and_return(config: AccountConfig, limit: int = MAX_DOCS_PER_HELPER)
 	result = {
 		"delivery_notes": [],
 		"invoices": [],
+		"linked_invoices": [],
 		"returns": [],
 		"return_charges": [],
 		"failed": [],
@@ -193,19 +271,47 @@ def _delivered_filters(config, **extra) -> dict:
 def _create_delivery_notes(config, result, limit):
 	orders = frappe.get_all(
 		"Sales Order",
-		filters=_delivered_filters(config, custom_postex_delivery_note=("is", "not set")),
-		fields=["name", "custom_postex_pickup_entry"],
+		filters=_delivered_filters(
+			config,
+			custom_postex_delivery_note=("is", "not set"),
+			# already invoiced (by this app or by hand) => stock already moved
+			custom_postex_sales_invoice=("is", "not set"),
+			per_delivered=("<", 100),
+		),
+		fields=["name", "custom_postex_pickup_entry", "per_delivered", "custom_postex_tracking_number"],
 		limit=limit,
 		order_by="modified desc",
 	)
 
 	for order in orders:
 		if not _pickup_submitted(order):
-			result["failed"].append(f"{order.name}: no submitted pickup entry")
+			_fail(
+				result,
+				order.name,
+				"delivery",
+				"no submitted pickup entry",
+				order.get("custom_postex_tracking_number"),
+			)
+			continue
+		if flt(order.get("per_delivered")) >= 100:
+			result["skipped"] = result.get("skipped", 0) + 1
 			continue
 		try:
 			so = frappe.get_doc("Sales Order", order.name)
-			if not _courier_is_ours(so):
+			if _skip_order(so):
+				continue
+			if so.get("custom_postex_delivery_note") or so.get("custom_postex_sales_invoice"):
+				# another run (or a human) already produced the chain
+				continue
+			existing_dn_invoice = _existing_invoice(so.name)
+			if existing_dn_invoice:
+				_fail(
+					result,
+					so.name,
+					"delivery",
+					f"invoice {existing_dn_invoice} already bills this order",
+					so.get("custom_postex_tracking_number"),
+				)
 				continue
 			dn = frappe.get_doc(
 				{
@@ -240,20 +346,33 @@ def _create_delivery_notes(config, result, limit):
 					},
 				)
 			if not dn.items:
-				result["failed"].append(f"{so.name}: nothing left to deliver")
+				_fail(
+					result,
+					so.name,
+					"delivery",
+					"nothing left to deliver",
+					so.get("custom_postex_tracking_number"),
+				)
 				continue
 
 			submit(dn)
 			if not _claim_field("Sales Order", so.name, "custom_postex_delivery_note", dn.name):
 				_cancel_and_drop(dn)
-				result["failed"].append(f"{so.name}: duplicate delivery note prevented")
+				_fail(
+					result,
+					so.name,
+					"delivery",
+					"duplicate delivery note prevented",
+					so.get("custom_postex_tracking_number"),
+				)
 				continue
 
+			clear_failures(so.name)
 			result["delivery_notes"].append(f"{so.name}={dn.name}")
 			frappe.db.commit()
 		except Exception as exc:
 			log_error("PostEx delivery note failed", f"{order.name}: {exc}", "Sales Order", order.name)
-			result["failed"].append(f"{order.name}: {str(exc)[:120]}")
+			_fail(result, order.name, "delivery", str(exc)[:120])
 
 
 def _create_invoices(config, result, limit):
@@ -264,7 +383,7 @@ def _create_invoices(config, result, limit):
 			custom_postex_delivery_note=("is", "set"),
 			custom_postex_sales_invoice=("is", "not set"),
 		),
-		fields=["name", "custom_postex_delivery_note"],
+		fields=["name", "custom_postex_delivery_note", "custom_postex_tracking_number"],
 		limit=limit,
 		order_by="modified desc",
 	)
@@ -272,11 +391,30 @@ def _create_invoices(config, result, limit):
 	for order in orders:
 		try:
 			so = frappe.get_doc("Sales Order", order.name)
-			if not _courier_is_ours(so):
+			if _skip_order(so):
+				continue
+			existing = _existing_invoice(so.name)
+			if existing:
+				# Never a second invoice for the same delivery, whatever created
+				# the first one. Record the link instead of failing: it repairs
+				# the Sales Order and lets settlement see the invoice.
+				if not so.get("custom_postex_sales_invoice"):
+					frappe.db.set_value(
+						"Sales Order", so.name, "custom_postex_sales_invoice", existing
+					)
+					clear_failures(so.name)
+					result.setdefault("linked_invoices", []).append(f"{so.name}={existing}")
+					frappe.db.commit()
 				continue
 			dn = frappe.get_doc("Delivery Note", order.custom_postex_delivery_note)
 			if dn.docstatus != 1:
-				result["failed"].append(f"{order.name}: delivery note not submitted")
+				_fail(
+					result,
+					order.name,
+					"invoice",
+					"delivery note not submitted",
+					order.get("custom_postex_tracking_number"),
+				)
 				continue
 
 			# A zero-value invoice has nothing for the courier to remit.
@@ -337,7 +475,7 @@ def _create_invoices(config, result, limit):
 					},
 				)
 			if not si.items:
-				result["failed"].append(f"{order.name}: delivery note has no items")
+				_fail(result, order.name, "invoice", "delivery note has no items")
 				continue
 			for tax in so.taxes:
 				si.append(
@@ -367,14 +505,21 @@ def _create_invoices(config, result, limit):
 			si.submit()
 			if not _claim_field("Sales Order", so.name, "custom_postex_sales_invoice", si.name):
 				_cancel_and_drop(si)
-				result["failed"].append(f"{so.name}: duplicate invoice prevented")
+				_fail(
+					result,
+					so.name,
+					"invoice",
+					"duplicate invoice prevented",
+					so.get("custom_postex_tracking_number"),
+				)
 				continue
 
+			clear_failures(so.name)
 			result["invoices"].append(f"{so.name}={si.name}")
 			frappe.db.commit()
 		except Exception as exc:
 			log_error("PostEx sales invoice failed", f"{order.name}: {exc}", "Sales Order", order.name)
-			result["failed"].append(f"{order.name}: {str(exc)[:120]}")
+			_fail(result, order.name, "invoice", str(exc)[:120])
 
 
 # ---------------------------------------------------------------------------
@@ -397,6 +542,7 @@ def _process_returns(config, result, limit):
 		fields=[
 			"name",
 			"custom_postex_pickup_entry",
+			"custom_postex_tracking_number",
 			"custom_postex_reversal_fee",
 			"custom_postex_reversal_tax",
 		],
@@ -409,14 +555,15 @@ def _process_returns(config, result, limit):
 			continue
 		try:
 			so = frappe.get_doc("Sales Order", order.name)
-			if not _courier_is_ours(so):
+			if _skip_order(so):
 				continue
 			_book_return_charges(config, so, order, result)
 			_move_return_stock(config, so, result)
+			clear_failures(so.name)
 			frappe.db.commit()
 		except Exception as exc:
 			log_error("PostEx return transfer failed", f"{order.name}: {exc}", "Sales Order", order.name)
-			result["failed"].append(f"{order.name}: {str(exc)[:120]}")
+			_fail(result, order.name, "return", str(exc)[:120], order.get("custom_postex_tracking_number"))
 
 
 def _book_return_charges(config, so, order, result):
@@ -459,7 +606,13 @@ def _book_return_charges(config, so, order, result):
 	submit(je)
 	if not _claim_field("Sales Order", so.name, "custom_postex_return_charges_entry", je.name):
 		_cancel_and_drop(je)
-		result["failed"].append(f"{so.name}: duplicate return charges prevented")
+		_fail(
+			result,
+			so.name,
+			"return",
+			"duplicate return charges prevented",
+			so.get("custom_postex_tracking_number"),
+		)
 		return
 	result["return_charges"].append(je.name)
 
@@ -497,6 +650,12 @@ def _move_return_stock(config, so, result):
 	submit(se)
 	if not _claim_field("Sales Order", so.name, "custom_postex_return_entry", se.name):
 		_cancel_and_drop(se)
-		result["failed"].append(f"{so.name}: duplicate return transfer prevented")
+		_fail(
+			result,
+			so.name,
+			"return",
+			"duplicate return transfer prevented",
+			so.get("custom_postex_tracking_number"),
+		)
 		return
 	result["returns"].append(f"{so.name}={se.name}")

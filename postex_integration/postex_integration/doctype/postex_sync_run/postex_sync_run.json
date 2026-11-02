@@ -10,6 +10,7 @@
   "postex_account",
   "company",
   "status",
+  "mode",
   "column_break_main",
   "started_on",
   "finished_on",
@@ -21,8 +22,13 @@
   "column_break_counts",
   "booked",
   "errors",
+  "requests",
+  "budget_exhausted",
   "section_break_summary",
-  "summary"
+  "summary",
+  "unmatched",
+  "section_break_failures",
+  "failures"
  ],
  "fields": [
   {
@@ -49,6 +55,15 @@
    "in_standard_filter": 1,
    "label": "Status",
    "options": "\nRunning\nSuccess\nPartial\nFailed\nSkipped",
+   "read_only": 1
+  },
+  {
+   "fieldname": "mode",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Mode",
+   "options": "\nActive\nLate Returns",
    "read_only": 1
   },
   {
@@ -113,6 +128,21 @@
    "read_only": 1
   },
   {
+   "fieldname": "requests",
+   "fieldtype": "Int",
+   "label": "HTTP Requests",
+   "read_only": 1,
+   "description": "Calls actually made against this account's run_request_budget."
+  },
+  {
+   "default": "0",
+   "fieldname": "budget_exhausted",
+   "fieldtype": "Check",
+   "label": "Budget Exhausted",
+   "read_only": 1,
+   "description": "Set when the run stopped early because the request budget was spent. The cursor keeps the rest for the next run."
+  },
+  {
    "fieldname": "section_break_summary",
    "fieldtype": "Section Break"
   },
@@ -121,11 +151,30 @@
    "fieldtype": "Small Text",
    "label": "Summary",
    "read_only": 1
+  },
+  {
+   "description": "Orders this run found no PostEx record for, by name (the sync retries them on the next pass).",
+   "fieldname": "unmatched",
+   "fieldtype": "Small Text",
+   "label": "No PostEx Record",
+   "read_only": 1
+  },
+  {
+   "fieldname": "section_break_failures",
+   "fieldtype": "Section Break",
+   "label": "Failures"
+  },
+  {
+   "description": "One row per failed or skipped step: which order, which step, what error.",
+   "fieldname": "failures",
+   "fieldtype": "Table",
+   "label": "Failures",
+   "options": "PostEx Sync Failure"
   }
  ],
  "index_web_pages_for_search": 0,
  "links": [],
- "modified": "2026-10-26 14:00:00.000000",
+ "modified": "2026-11-02 10:00:00.000000",
  "modified_by": "Administrator",
  "module": "PostEx Integration",
  "name": "PostEx Sync Run",
