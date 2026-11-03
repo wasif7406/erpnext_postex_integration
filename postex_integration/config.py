@@ -22,6 +22,7 @@ from .constants import (
 	ROLE_TAX_WITHHELD,
 	ROLE_UNACCOUNTED,
 	ROLE_UNSETTLED_COD,
+	ROLE_STOCK_LOSS,
 	WAREHOUSE_ROLES,
 )
 from .exceptions import PostExConfigError
@@ -134,6 +135,8 @@ class AccountConfig:
 		self.tax_withheld = self._account(ROLE_TAX_WITHHELD)
 		self.unsettled_cod = self._account(ROLE_UNSETTLED_COD)
 		self.unaccounted = self._account(ROLE_UNACCOUNTED, required=False)
+		# Optional: only Lost/Damage/Stolen stock write-offs need it.
+		self.stock_loss = self._account(ROLE_STOCK_LOSS, required=False)
 
 		self.in_transit_warehouse = self._warehouse(ROLE_IN_TRANSIT)
 		self.stores_warehouse = self._warehouse(ROLE_STORES)
@@ -187,6 +190,7 @@ class AccountConfig:
 			"tax_withheld": self.tax_withheld,
 			"unsettled_cod": self.unsettled_cod,
 			"unaccounted": self.unaccounted,
+			"stock_loss": self.stock_loss,
 			"in_transit_warehouse": self.in_transit_warehouse,
 			"stores_warehouse": self.stores_warehouse,
 			"cost_center": self.cost_center,

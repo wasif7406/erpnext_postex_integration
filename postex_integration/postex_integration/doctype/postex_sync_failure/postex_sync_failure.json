@@ -27,7 +27,7 @@
    "fieldtype": "Select",
    "in_list_view": 1,
    "label": "Step",
-   "options": "\nsync\npickup\ndelivery\ninvoice\nreturn\nsettlement",
+   "options": "\nsync\npickup\ndelivery\ninvoice\nreturn\nsettlement\nterminal",
    "reqd": 1
   },
   {

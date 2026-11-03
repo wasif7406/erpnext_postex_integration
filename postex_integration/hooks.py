@@ -4,7 +4,7 @@ app_publisher = "Aqreno Nova"
 app_description = "Multi-company, multi-account PostEx courier integration"
 app_email = "dev@aqrenonova.com"
 app_license = "mit"
-app_version = "0.2.0"
+app_version = "0.3.0"
 
 required_apps = ["erpnext"]
 
@@ -36,6 +36,7 @@ doc_events = {
 			"postex_integration.booking.validate_account_change",
 		],
 		"on_submit": "postex_integration.booking.on_sales_order_submit",
+		"on_cancel": "postex_integration.booking.on_sales_order_cancel",
 	}
 }
 

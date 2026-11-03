@@ -158,6 +158,7 @@ def _digest_account(account_name):
 	coverage = f"{active * 24.0 / scanned:.1f} h" if scanned else "no successful scans"
 
 	documents = _documents_created(account_name, cutoff)
+	ready_work, blocked_work = _helper_backlog(account)
 
 	try:
 		config = AccountConfig(account)
@@ -175,10 +176,16 @@ def _digest_account(account_name):
 		f"No PostEx record: {len(unmatched)} order(s)"
 		+ (f" — {', '.join(sorted(unmatched)[:15])}" if unmatched else ""),
 		f"Newly quarantined: {quarantined}",
+		f"Helper backlog: {ready_work} order(s) ready, {blocked_work} blocked by quarantine",
 		f"Documents created: {documents}",
 		f"Cash expected (unsettled COD): {expected:,.2f}",
 		f"Cash received into the wallet in 24 h: {received:,.2f}",
 	]
+	if blocked_work:
+		lines.append(
+			f"ALERT: {blocked_work} quarantined order(s) are holding back document "
+			"creation. Fix the cause and press Re-queue for sync."
+		)
 	body = "\n".join(lines)
 	_notify(f"PostEx daily digest — {account.account_name}", body)
 
@@ -198,6 +205,29 @@ def _digest_account(account_name):
 				title="PostEx digest email failed",
 				message=f"{account_name}\n{frappe.get_traceback()}",
 			)
+
+
+def _helper_backlog(account):
+	"""(ready, blocked) backlog totals for the digest.
+
+	A counting failure must never break the digest: the digest is the only thing
+	that tells the merchant the integration is silent.
+	"""
+	try:
+		from .config import AccountConfig
+		from .stock import helper_backlog
+
+		backlog = helper_backlog(AccountConfig(account))
+	except Exception:
+		frappe.log_error(
+			title="PostEx backlog count failed",
+			message=f"{account}\n{frappe.get_traceback()}",
+		)
+		return 0, 0
+
+	ready = sum(int(v.get("ready") or 0) for v in backlog.values() if isinstance(v, dict))
+	blocked = sum(int(v.get("blocked") or 0) for v in backlog.values() if isinstance(v, dict))
+	return ready, blocked
 
 
 def _documents_created(account_name, cutoff) -> str:

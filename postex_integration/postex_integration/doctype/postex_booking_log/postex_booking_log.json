@@ -16,6 +16,7 @@
   "tracking_number",
   "source",
   "error_message",
+  "remarks",
   "section_break_payload",
   "request_hash",
   "request_payload",
@@ -53,7 +54,7 @@
    "in_list_view": 1,
    "in_standard_filter": 1,
    "label": "Status",
-   "options": "\nSuccess\nFailed\nSkipped",
+   "options": "\nSuccess\nFailed\nSkipped\nCancelled\nUnconfirmed",
    "read_only": 1
   },
   {
@@ -86,6 +87,12 @@
    "read_only": 1
   },
   {
+   "fieldname": "remarks",
+   "fieldtype": "Small Text",
+   "label": "Remarks",
+   "read_only": 1
+  },
+  {
    "fieldname": "section_break_payload",
    "fieldtype": "Section Break",
    "label": "Payload"
@@ -112,7 +119,7 @@
  ],
  "index_web_pages_for_search": 0,
  "links": [],
- "modified": "2026-10-26 14:00:00.000000",
+ "modified": "2026-11-03 10:00:00.000000",
  "modified_by": "Administrator",
  "module": "PostEx Integration",
  "name": "PostEx Booking Log",

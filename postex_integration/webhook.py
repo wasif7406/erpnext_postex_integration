@@ -9,6 +9,7 @@ stock entries or accounting documents, so there is exactly one writer for those.
 import hmac
 
 import frappe
+from frappe.utils import cint
 
 from .constants import POSTEX_COURIER
 from .utils import dump_snippet, field_exists, log_error, map_status, now
@@ -135,6 +136,11 @@ def _apply(account_doc, tracking, mapped):
 				f"not {account_doc.name}"
 			)
 		return None, f"no sales order with tracking {tracking} for account {account_doc.name}"
+
+	# A booking the merchant cancelled must not be resurrected by a stale call.
+	if cint(frappe.db.get_value("Sales Order", order, "custom_postex_booking_cancelled")):
+		if mapped and mapped != "Cancelled":
+			return order, f"ignored: booking cancelled locally (incoming: {mapped})"
 
 	if (frappe.db.get_value("Sales Order", order, "custom_courier") or "") != POSTEX_COURIER:
 		frappe.db.set_value("Sales Order", order, "custom_courier", POSTEX_COURIER)

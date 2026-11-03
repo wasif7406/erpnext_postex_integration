@@ -20,9 +20,33 @@ from .constants import (
 	PAYMENT_PAID,
 )
 from .exceptions import PostExAPIError, PostExConfigError
-from .utils import bump_failures, clear_failures, field_exists, log_error, today_or
+from .utils import bump_failures, claim_field, clear_failures, field_exists, log_error, today_or
 
 SETTLEMENT_CURSOR = "custom_postex_payout_checked_on"
+
+
+# ---------------------------------------------------------------------------
+# Claim helpers
+# ---------------------------------------------------------------------------
+def _is_submitted(doctype: str, name: str) -> bool:
+	"""True only for a submitted document; a cancelled/draft/deleted one is not a
+	live claim and may be replaced (see `utils.claim_field`)."""
+	return frappe.db.get_value(doctype, name, "docstatus") == 1
+
+
+def _cancel_quietly(doc) -> bool:
+	"""Cancel a document this run created by mistake. True when it is cancelled."""
+	try:
+		doc.flags.ignore_permissions = True
+		doc.cancel()
+		frappe.db.commit()
+		return frappe.db.get_value(doc.doctype, doc.name, "docstatus") == 2
+	except Exception:
+		log_error(
+			"PostEx: could not cancel a duplicate document",
+			f"{doc.doctype} {doc.name}\n{frappe.get_traceback()}",
+		)
+		return False
 
 
 def reconcile_all(company=None) -> dict:
@@ -171,7 +195,8 @@ def reconcile_account(account: str, limit: int = MAX_PAYMENT_STATUS_CALLS) -> di
 # ---------------------------------------------------------------------------
 def _book_charges(config: AccountConfig, order, invoice, settled_on, tracking, result):
 	"""Book the courier fee (+GST) and the withheld tax against the invoice."""
-	if order.custom_postex_charges_entry:
+	existing = order.custom_postex_charges_entry
+	if existing and _is_submitted("Journal Entry", existing):
 		return invoice
 
 	fee = flt(order.custom_postex_delivery_fee)
@@ -266,9 +291,16 @@ def _book_charges(config: AccountConfig, order, invoice, settled_on, tracking, r
 		bump_failures(order.name, "settlement", f"charges: {exc}")
 		return invoice
 
-	frappe.db.set_value(
-		"Sales Order", order.name, "custom_postex_charges_entry", je.name, update_modified=False
-	)
+	# Claim the order *conditionally*: a concurrent run may have booked its own
+	# charges entry while this one was submitting. `allow=existing` takes over a
+	# link left on a cancelled/draft entry by an interrupted run.
+	if not claim_field(
+		"Sales Order", order.name, "custom_postex_charges_entry", je.name, allow=existing
+	):
+		_cancel_quietly(je)
+		result["failed"].append(f"{order.name}: duplicate charges entry prevented ({je.name})")
+		return frappe.get_doc("Sales Invoice", invoice.name)
+
 	frappe.db.set_value(
 		"Sales Invoice",
 		invoice.name,
@@ -279,18 +311,6 @@ def _book_charges(config: AccountConfig, order, invoice, settled_on, tracking, r
 		update_modified=False,
 	)
 	result["charges_entries"].append(je.name)
-
-	# Verify-after-create: another run may have stored a different JE.
-	winner = frappe.db.get_value("Sales Order", order.name, "custom_postex_charges_entry")
-	if winner and winner != je.name:
-		try:
-			je.flags.ignore_permissions = True
-			je.cancel()
-			frappe.db.commit()
-		except Exception:
-			pass
-		result["failed"].append(f"{order.name}: duplicate charges entry prevented")
-		return frappe.get_doc("Sales Invoice", invoice.name)
 
 	return frappe.get_doc("Sales Invoice", invoice.name)
 
@@ -339,14 +359,21 @@ def _create_payment(config: AccountConfig, group, result):
 		)
 		return
 
+	# Claim every order of the group. The claim is a conditional UPDATE, so a
+	# concurrent run that already paid one of them makes us the loser instead of
+	# silently overwriting its link (which is what duplicated payouts before).
+	claimed = []
 	for sales_order in group["orders"]:
+		if not _claim_payout(sales_order, pe.name):
+			_drop_duplicate_payment(pe, claimed, group, result)
+			return
+		claimed.append(sales_order)
+
+	for sales_order in claimed:
 		frappe.db.set_value(
 			"Sales Order",
 			sales_order,
-			{
-				"custom_postex_payout_entry": pe.name,
-				"custom_postex_settled_on": group["date"],
-			},
+			{"custom_postex_settled_on": group["date"]},
 			update_modified=False,
 		)
 		clear_failures(sales_order)
@@ -368,35 +395,55 @@ def _create_payment(config: AccountConfig, group, result):
 	result["settled"] += len(group["orders"])
 	frappe.db.commit()
 
-	# Verify-after-create on the first order of the group.
-	winner = frappe.db.get_value("Sales Order", group["orders"][0], "custom_postex_payout_entry")
-	if winner and winner != pe.name:
-		try:
-			pe.flags.ignore_permissions = True
-			pe.cancel()
-			frappe.db.commit()
-		except Exception:
-			pass
-		# Our links are stale now: point them at the winner instead.
-		for sales_order in group["orders"]:
-			frappe.db.set_value(
-				"Sales Order", sales_order, "custom_postex_payout_entry", winner,
-				update_modified=False,
-			)
-		for ref in group["refs"]:
-			frappe.db.set_value(
-				"Sales Invoice", ref["reference_name"], "custom_postex_payout_entry", winner,
-				update_modified=False,
-			)
-		frappe.db.commit()
-		result["payments"].remove(pe.name)
-		result["failed"].append(
-			{
-				"sales_order": group["orders"][0] if group["orders"] else None,
-				"step": "settlement",
-				"error": f"duplicate payment prevented {pe.name}",
-			}
+
+def _claim_payout(sales_order: str, payment_entry: str) -> bool:
+	"""Claim one order for this payment entry.
+
+	`allow` matters here: if an interrupted run left a link to a payment entry
+	that was never submitted, the order would otherwise be unclaimable forever.
+	A link to a *submitted* entry is a real claim and is never taken over.
+	"""
+	if claim_field("Sales Order", sales_order, "custom_postex_payout_entry", payment_entry):
+		return True
+	current = frappe.db.get_value("Sales Order", sales_order, "custom_postex_payout_entry")
+	if current and not _is_submitted("Payment Entry", current):
+		return claim_field(
+			"Sales Order",
+			sales_order,
+			"custom_postex_payout_entry",
+			payment_entry,
+			allow=current,
 		)
+	return False
+
+
+def _drop_duplicate_payment(pe, claimed, group, result):
+	"""Another run already paid part of this group: undo ours completely.
+
+	The payment entry is cancelled (which reverses its GL and its allocations)
+	and the orders we had claimed are released, so the next run settles them
+	again. A crash between the two steps is safe: the released link is the only
+	thing that matters, and a claim on a cancelled entry is taken over later.
+	"""
+	cancelled = _cancel_quietly(pe)
+	if cancelled and claimed:
+		frappe.db.sql(
+			"""
+			update `tabSales Order`
+			set custom_postex_payout_entry = null
+			where name in %s
+			  and custom_postex_payout_entry = %s
+			""",
+			(tuple(claimed), pe.name),
+		)
+	frappe.db.commit()
+	result["failed"].append(
+		{
+			"sales_order": group["orders"][0] if group["orders"] else None,
+			"step": "settlement",
+			"error": f"duplicate payment prevented {pe.name}",
+		}
+	)
 
 
 def _mark_settled_on_order(sales_order, settled_on):

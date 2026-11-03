@@ -16,7 +16,7 @@
    "fieldtype": "Select",
    "in_list_view": 1,
    "label": "Role",
-   "options": "\nCourier Finance\nDebtors\nDelivery Charges\nTax Withheld\nUnsettled COD\nUnaccounted\nIn-Transit Warehouse\nStores Warehouse\nCost Center",
+   "options": "\nCourier Finance\nDebtors\nDelivery Charges\nTax Withheld\nUnsettled COD\nUnaccounted\nStock Loss\nIn-Transit Warehouse\nStores Warehouse\nCost Center",
    "reqd": 1,
    "columns": 3
   },

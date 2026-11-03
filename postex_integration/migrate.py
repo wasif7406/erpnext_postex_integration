@@ -19,6 +19,7 @@ from .constants import (
 	ROLE_FINANCE,
 	ROLE_IN_TRANSIT,
 	ROLE_STORES,
+	ROLE_STOCK_LOSS,
 	ROLE_TAX_WITHHELD,
 	ROLE_UNACCOUNTED,
 	ROLE_UNSETTLED_COD,
@@ -30,6 +31,7 @@ DEFAULT_BASE_URL = "https://api.postex.pk"
 PROVISION_ACCOUNTS = {
 	ROLE_FINANCE: ("Postex Finance", "Asset", "Bank", ("Bank Accounts", "Current Assets")),
 	ROLE_DELIVERY_CHARGES: ("Delivery Charges", "Expense", "", ("Direct Expenses", "Expenses")),
+	ROLE_STOCK_LOSS: ("Stock Loss", "Expense", "", ("Direct Expenses", "Expenses")),
 	ROLE_TAX_WITHHELD: (
 		"PostEx Tax Withheld (Advance Tax)",
 		"Asset",

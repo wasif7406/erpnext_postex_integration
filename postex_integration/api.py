@@ -1,16 +1,22 @@
 """Whitelisted endpoints used by buttons, desk calls and bench execute."""
 
+import re
+
 import frappe
 from frappe import _
-from frappe.utils import flt
+from frappe.utils import add_days, cint, flt, nowdate
 
 from . import booking as booking_module
 from . import settlement, sync
-from .config import default_account, get_account
+from .config import account_for_document, default_account, get_account
 from .constants import POSTEX_COURIER
 from .tasks import run_locked
+from .utils import map_status, norm
 
 WRITE_ROLES = ("System Manager", "Accounts Manager")
+
+# How many candidates the manual "link a booking" search returns.
+BOOKING_SEARCH_LIMIT = 20
 
 
 # ---------------------------------------------------------------------------
@@ -31,6 +37,43 @@ def book_order(sales_order, account=None):
 
 
 @frappe.whitelist()
+def cancel_booking(sales_order, reason=None, account=None):
+	"""Cancel a PostEx booking (manual button).
+
+	Only for an order that has not moved: no submitted pickup transfer, no
+	delivery note, no invoice. The booking is cancelled at PostEx first; a 404
+	there (already cancelled) still allows the local cancellation.
+	"""
+	if not sales_order:
+		frappe.throw(_("A Sales Order is required."))
+	if not frappe.has_permission("Sales Order", "write", doc=sales_order):
+		frappe.throw(_("Not permitted to change this Sales Order."), frappe.PermissionError)
+	return booking_module.cancel_booking(
+		sales_order, account=account, reason=reason, source="manual"
+	)
+
+
+@frappe.whitelist()
+def reopen_booking(sales_order):
+	"""Undo a cancellation so the order re-enters the automatic sync."""
+	if not sales_order:
+		frappe.throw(_("A Sales Order is required."))
+	if not frappe.has_permission("Sales Order", "write", doc=sales_order):
+		frappe.throw(_("Not permitted to change this Sales Order."), frappe.PermissionError)
+	return booking_module.reopen_booking(sales_order, source="manual")
+
+
+@frappe.whitelist()
+def clear_booking_doubt(sales_order):
+	"""A human checked PostEx and the reference is not booked: allow a retry."""
+	if not sales_order:
+		frappe.throw(_("A Sales Order is required."))
+	if not frappe.has_permission("Sales Order", "write", doc=sales_order):
+		frappe.throw(_("Not permitted to change this Sales Order."), frappe.PermissionError)
+	return booking_module.clear_booking_doubt(sales_order, source="manual")
+
+
+@frappe.whitelist()
 def get_booking_accounts(sales_order):
 	"""Enabled PostEx accounts of the order's company, for the booking dialog."""
 	so = frappe.get_doc("Sales Order", sales_order)
@@ -47,6 +90,192 @@ def get_booking_accounts(sales_order):
 		"current": so.get("custom_postex_account") or None,
 		"accounts": accounts,
 	}
+
+
+# ---------------------------------------------------------------------------
+# Manual matching: link an existing PostEx booking
+# ---------------------------------------------------------------------------
+@frappe.whitelist()
+def find_bookings(sales_order, search=None):
+	"""Search this account's PostEx feed for a booking to link by hand.
+
+	The reference alone does not always identify an order (the old OMS writes
+	`VM####`, Shopify writes its own number, the oldest orders use `aug27/8`),
+	so the search accepts a reference, a phone number or a customer name.
+	"""
+	if not sales_order:
+		frappe.throw(_("A Sales Order is required."))
+	so = frappe.get_doc("Sales Order", sales_order)
+	if not frappe.has_permission("Sales Order", "read", doc=so):
+		frappe.throw(_("Not permitted to read this Sales Order."), frappe.PermissionError)
+
+	from .client import PostExClient
+	from .exceptions import PostExConfigError
+
+	try:
+		account_doc = account_for_document(so)
+	except PostExConfigError as exc:
+		frappe.throw(str(exc))
+
+	window = int(account_doc.get("sync_window_days") or 60)
+	items = PostExClient(account_doc).list_orders(add_days(nowdate(), -window), nowdate())
+
+	text = (search or "").strip() or (
+		so.get("shopify_order_number") or so.get("po_no") or so.name
+	)
+	key = norm(text)
+	phone_query = re.sub(r"\D", "", text)
+	phone_query = phone_query[-10:] if len(phone_query) >= 7 else ""
+	name_query = text.lower()
+
+	rows = []
+	seen = set()
+	for item in items:
+		tracking = (item.get("trackingNumber") or "").strip()
+		if not tracking or tracking in seen:
+			continue
+		reference = item.get("orderRefNumber") or ""
+		phone = re.sub(r"\D", "", str(item.get("customerPhone") or ""))[-10:]
+		customer = str(item.get("customerName") or "")
+
+		if not (
+			(key and key in norm(reference))
+			or (phone_query and phone and phone_query == phone)
+			or (name_query and name_query in customer.lower())
+		):
+			continue
+
+		status = map_status(item.get("transactionStatus"))
+		if status in ("Cancelled", "Expired"):
+			continue  # a dead parcel is never worth linking
+
+		seen.add(tracking)
+		rows.append(
+			{
+				"reference": reference,
+				"tracking_number": tracking,
+				"status": status or (item.get("transactionStatus") or ""),
+				"date": str(item.get("transactionDate") or "")[:10],
+				"customer": customer,
+				"phone": item.get("customerPhone") or "",
+				"amount": flt(item.get("invoicePayment")),
+				"linked_to": _tracking_owner(tracking, so.name),
+			}
+		)
+
+	# newest first, then exact reference matches on top (stable sorts)
+	rows.sort(key=lambda row: str(row.get("date") or ""), reverse=True)
+	rows.sort(key=lambda row: norm(row["reference"]) != key)
+	return rows[:BOOKING_SEARCH_LIMIT]
+
+
+@frappe.whitelist()
+def link_booking(sales_order, tracking, account=None):
+	"""Attach an existing PostEx booking to a Sales Order (manual match).
+
+	The escape hatch for an order the sync could not match: PostEx is asked for
+	the tracking (one call) so the status, fee and delivery date are written
+	exactly like a normal sync would.
+	"""
+	if not sales_order or not tracking:
+		frappe.throw(_("A Sales Order and a tracking number are required."))
+	so = frappe.get_doc("Sales Order", sales_order)
+	if not frappe.has_permission("Sales Order", "write", doc=so):
+		frappe.throw(_("Not permitted to change this Sales Order."), frappe.PermissionError)
+	if so.docstatus != 1:
+		frappe.throw(_("Submit the Sales Order before linking a booking."))
+	if (so.get("custom_postex_tracking_number") or "").strip():
+		frappe.throw(_("This order already has a tracking number."))
+	if cint(so.get("custom_postex_booking_cancelled")):
+		frappe.throw(_("This booking was cancelled; use 'Reopen PostEx Booking' first."))
+
+	tracking = str(tracking).strip().replace(" ", "")
+	owner = _tracking_owner(tracking, so.name)
+	if owner:
+		frappe.throw(_("Tracking {0} already belongs to {1}.").format(tracking, owner))
+
+	from .client import PostExClient
+	from .exceptions import PostExAPIError, PostExConfigError
+	from .sync import _write_payload
+	from .utils import clear_failures
+
+	try:
+		account_doc = account_for_document(so, account=account)
+	except PostExConfigError as exc:
+		frappe.throw(str(exc))
+
+	try:
+		payload = PostExClient(account_doc).track_order(tracking)
+	except PostExAPIError as exc:
+		frappe.throw(str(exc)[:300])
+	if not payload:
+		frappe.throw(_("PostEx has no booking with tracking {0}.").format(tracking))
+	payload_status = map_status(payload.get("transactionStatus"))
+	if payload_status in ("Cancelled", "Expired"):
+		frappe.throw(
+			_("The booking with tracking {0} is {1} at PostEx; there is nothing to link.").format(
+				tracking, payload_status
+			)
+		)
+
+	result = {"tracking_filled": 0, "status_set": 0, "courier_filled": 0, "unchanged": 0}
+	written = _write_payload(account_doc, frappe._dict(so.as_dict()), payload, "", result)
+	if written is None:
+		frappe.throw(_("That tracking number already belongs to another Sales Order."))
+
+	if not so.get("custom_postex_account"):
+		frappe.db.set_value("Sales Order", so.name, "custom_postex_account", account_doc.name)
+	# a human just resolved what the sync could not: un-quarantine the order
+	clear_failures(so.name)
+	frappe.db.commit()
+
+	so.add_comment(
+		text=f"PostEx booking linked by hand: {written} on account {account_doc.name}"
+	)
+	# A Success row makes this a known booking: auto-booking can never duplicate it.
+	booking_module._log(
+		so,
+		account_doc.name,
+		so.get("shopify_order_number") or so.get("po_no") or so.name,
+		"Success",
+		{},
+		payload,
+		None,
+		"manual",
+		remarks="linked to an existing PostEx booking",
+	)
+
+	values = (
+		frappe.db.get_value(
+			"Sales Order",
+			so.name,
+			[
+				"custom_postex_status",
+				"custom_postex_delivered_on",
+				"custom_postex_sales_invoice",
+				"custom_postex_return_entry",
+			],
+			as_dict=True,
+		)
+		or {}
+	)
+	status = (values.get("custom_postex_status") or "").strip()
+	return {
+		"ok": 1,
+		"tracking": written,
+		"status": status,
+		"delivered_on": str(values.get("custom_postex_delivered_on") or ""),
+		"next_step": _next_step(status, values),
+	}
+
+
+def _tracking_owner(tracking, sales_order):
+	"""The other Sales Order already carrying this tracking number, if any."""
+	return frappe.db.get_value(
+		"Sales Order",
+		{"custom_postex_tracking_number": tracking, "name": ("!=", sales_order)},
+		"name",
+	)
 
 
 @frappe.whitelist()
@@ -91,11 +320,15 @@ def sync_now(account=None, company=None, background=0):
 
 	if frappe.utils.cint(background):
 		for row in accounts:
+			# `sync_account_locked`, never `sync_account`: the lock is what keeps a
+			# backgrounded manual run from racing the cron into the same page (and
+			# from creating the same delivery note / invoice twice). The job name is
+			# distinct from the cron's so the two never collide as an RQ job id.
 			frappe.enqueue(
-				"postex_integration.sync.sync_account",
+				"postex_integration.sync.sync_account_locked",
 				queue="long",
 				timeout=1800,
-				job_name=f"postex-sync-{row}",
+				job_name=f"postex-sync-manual-{row}",
 				account=row,
 			)
 		return {"queued": accounts}
@@ -134,6 +367,13 @@ def resync_order(sales_order):
 	so = frappe.get_doc("Sales Order", sales_order)
 	if so.docstatus == 2:
 		frappe.throw(_("This Sales Order is cancelled; its courier status is not synced."))
+	if cint(so.get("custom_postex_booking_cancelled")):
+		frappe.throw(
+			_(
+				"This booking was cancelled. Use 'Reopen PostEx Booking' first if it "
+				"should be synced again."
+			)
+		)
 
 	courier = (so.get("custom_courier") or "").strip()
 	if courier and courier != POSTEX_COURIER:
@@ -180,6 +420,13 @@ def resync_order(sales_order):
 		"unchanged": 0,
 	}
 	new_tracking = _write_payload(account_doc, frappe._dict(so.as_dict()), payload, tracking, result)
+	if new_tracking is None:
+		return {
+			"ok": 0,
+			"error": _(
+				"PostEx tracking {0} already belongs to another Sales Order."
+			).format(tracking),
+		}
 	frappe.db.set_value(
 		"Sales Order",
 		so.name,
@@ -351,6 +598,20 @@ def health():
 			"duplicate_document_guards": True,
 			"webhook_watchdog": True,
 			"manual_status_fetch": True,
+			"manual_booking_cancel": True,
+			"quarantine_excluded_in_sql": True,
+			"helper_backlog_metric": True,
+			"cas_link_claims": True,
+			"background_sync_locked": True,
+			"booking_post_not_retried": True,
+			"booking_doubt_state": True,
+			"terminal_outcomes": True,
+			"tax_and_discount_rows_copied": True,
+			"delivery_date_posting": True,
+			"tolerant_reference_matching": True,
+			"ambiguous_reference_guard": True,
+			"manual_booking_link": True,
+			"auto_cancel_on_order_cancel": True,
 		},
 	}
 

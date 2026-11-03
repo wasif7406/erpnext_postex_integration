@@ -6,7 +6,7 @@ Anything that can differ per company or per merchant account belongs in
 
 # Bumped whenever we need to prove which code a site is actually running; call
 # `postex_integration.api.health` after a deploy and compare.
-BUILD = "2026-11-02.1"
+BUILD = "2026-11-04.8"
 
 POSTEX_COURIER = "PostEx"
 DEFAULT_BASE_URL = "https://api.postex.pk"
@@ -15,6 +15,8 @@ DEFAULT_BASE_URL = "https://api.postex.pk"
 EP_ALL_ORDERS = "/services/integration/api/order/v1/get-all-order"
 EP_UNBOOKED_ORDERS = "/services/integration/api/order/v2/get-unbooked-orders"
 EP_TRACK_ORDER = "/services/integration/api/order/v1/track-order/"
+# Guide v4.1.9 §3.13: PUT with {"trackingNumber": ...}; 200 = cancelled, 404 = unknown.
+EP_CANCEL_ORDER = "/services/integration/api/order/v1/cancel-order"
 EP_PAYMENT_STATUS = "/services/integration/api/order/v1/payment-status/"
 EP_ADD_ORDER = "/services/integration/api/order/v1/add-order"
 
@@ -105,7 +107,23 @@ PICKUP_STATUSES = (
 	"Delivered",
 )
 
-TERMINAL_STATUSES = ("Delivered", "Returned", "Cancelled", "Expired")
+# Outcomes that finish the order on our side, handled by `stock.close_terminals`.
+# `Delivered` is deliberately absent: it is finished by the delivery + invoice
+# flow and ERPNext marks it Completed itself, so closing it early would block
+# the invoice that has not been created yet.
+CLOSABLE_STATUSES = (
+	"Returned",
+	"Lost",
+	"Damage",
+	"Stolen",
+	"Cancelled",
+	"Expired",
+	"Un-Assigned By Me",
+)
+
+# A parcel in one of these states is gone: the stock that sits in the transit
+# warehouse must be written off, not moved back to Stores.
+LOSS_STATUSES = ("Lost", "Damage", "Stolen")
 
 # ---------------------------------------------------------------------------
 # Sync scope
@@ -176,6 +194,7 @@ ROLE_DELIVERY_CHARGES = "Delivery Charges"
 ROLE_TAX_WITHHELD = "Tax Withheld"
 ROLE_UNSETTLED_COD = "Unsettled COD"
 ROLE_UNACCOUNTED = "Unaccounted"
+ROLE_STOCK_LOSS = "Stock Loss"
 ROLE_IN_TRANSIT = "In-Transit Warehouse"
 ROLE_STORES = "Stores Warehouse"
 ROLE_COST_CENTER = "Cost Center"
@@ -187,6 +206,7 @@ ROLES = (
 	ROLE_TAX_WITHHELD,
 	ROLE_UNSETTLED_COD,
 	ROLE_UNACCOUNTED,
+	ROLE_STOCK_LOSS,
 	ROLE_IN_TRANSIT,
 	ROLE_STORES,
 	ROLE_COST_CENTER,
@@ -199,9 +219,12 @@ ACCOUNT_ROLES = (
 	ROLE_TAX_WITHHELD,
 	ROLE_UNSETTLED_COD,
 	ROLE_UNACCOUNTED,
+	ROLE_STOCK_LOSS,
 )
 WAREHOUSE_ROLES = (ROLE_IN_TRANSIT, ROLE_STORES)
 
+# `Stock Loss` is optional: only the Lost/Damage/Stolen handling needs it, and a
+# company that never loses a parcel should not be blocked by an empty mapping.
 REQUIRED_ROLES = (
 	ROLE_FINANCE,
 	ROLE_DEBTORS,
@@ -220,6 +243,7 @@ ACCOUNT_RULES = {
 	ROLE_TAX_WITHHELD: (("Asset", "Expense"), (), True),
 	ROLE_UNSETTLED_COD: (("Asset",), (), True),
 	ROLE_UNACCOUNTED: (("Liability", "Asset"), (), True),
+	ROLE_STOCK_LOSS: (("Expense",), (), True),
 }
 
 # ---------------------------------------------------------------------------

@@ -294,11 +294,41 @@ accounts — while still letting the user override any dropdown afterwards.
   tracking/status/courier/account back. When the company has more than one
   enabled account the desk asks which one to use (the order's existing
   `custom_postex_account` wins if set).
+- **Manual match**: button `Link PostEx Booking` → `api.find_bookings` searches
+  the account feed by reference / phone / customer → the chosen tracking is
+  verified with `track-order` and applied through the same `_write_payload` the
+  sync uses (status, fees, delivery date; a `Success` Booking Log row). This is
+  the escape hatch when the reference does not match (the old OMS numbering, a
+  manual re-booking) and the safe replacement for the removed phone+amount
+  heuristic.
 - **Automatic**: on `Sales Order.on_submit` (app hook) when
   `settings.enable_auto_booking`; fallback sweep in the sync for orders created
   while the switch was off.
+- **Cancel**: button `Cancel PostEx Booking` (Courier Detail) → PUT
+  `v1/cancel-order` with the tracking number, then marks the order
+  `custom_postex_booking_cancelled` so the poll and the webhook can never
+  resurrect it; the status is set to `Cancelled`, the dead tracking number is
+  cleared (kept in the Booking Log + comment) and a Booking Log row is written.
+  Refused once stock has moved (submitted pickup transfer) or the order has a
+  delivery note/invoice — that is a return, not a cancellation. A cancelled
+  Sales Order is accepted. Runs under the per-order booking lock.
+- **Auto-cancel**: `Sales Order.on_cancel` → `booking.on_sales_order_cancel` →
+  background `cancel_booking(source="auto")`, only when the account has
+  `enable_auto_cancel` (default off) and only for a PostEx booking that still
+  exists. Same guards as the button; a picked parcel is refused (return it).
+- `Reopen PostEx Booking` clears the flag, the status and the (already cleared)
+  tracking, so the order can be booked again.
 - Guard: never book twice (tracking present, or a Booking Log row already
   successful for that SO).
+- **Never a blind retry**: `add-order` is not idempotent, so the client does not
+  retry a POST at all. A timeout/5xx is raised as *ambiguous*; `book_order` then
+  looks the reference up in the feed and adopts the tracking if PostEx created
+  the order, otherwise it parks the order in `custom_postex_booking_doubt`.
+  Nothing automatic retries a doubted order; the next sync clears the flag when
+  the reference appears with a tracking number, or a human presses
+  **Clear booking doubt** after checking PostEx.
+- One `filelock("postex-book-<SO>")` per attempt, so a double click / sweep /
+  auto-booking job cannot post for the same order concurrently.
 
 ### 7.2 Status sync
 
@@ -319,10 +349,14 @@ Per account, in one scheduled run:
    attempt, successful or not — that is the cursor.
 5. Optional: book missing orders when `enable_auto_booking`.
 6. Run the stock/revenue helpers for this account (not for the late-return
-   sweep).
-7. Write the run record: counts, requests, budget flag, unmatched names and a
-   Failures table (order + step + error); quarantine an order after 5
-   consecutive failures; update `last_run_result`.
+   sweep). Their selection is entirely SQL — including the quarantine and
+   historical-import predicates — because `LIMIT` is applied by the database and
+   a Python-side skip would keep the same stuck rows in the newest 100 slots
+   forever. The run then counts what is still waiting (`helper_backlog`:
+   `ready/blocked` per step) and prints it in the summary.
+7. Write the run record: counts, requests, budget flag, unmatched names, the
+   backlog line and a Failures table (order + step + error); quarantine an order
+   after 5 consecutive failures; update `last_run_result`.
 
 The settlement stream is independent: it polls `payment-status` for delivered +
 invoiced + unsettled orders with its own cursor (`custom_postex_payout_checked_on`),
@@ -342,6 +376,23 @@ Material Transfer `Stores` → `PostEx In Transit` (that company's warehouses).
 3. book fee (+GST) as `Dr Delivery Charges / Cr Debtors` against the invoice,
 4. record `custom_postex_account`.
 
+Both documents get the Sales Order's tax **and discount** block through
+`stock._copy_charges()` — every field of `Sales Taxes and Charges`, including
+`tax_amount` (an `Actual` row keeps its amount there, `rate` is 0). Copying it
+to the Delivery Note too is what keeps the "invoice must equal the delivery"
+check meaningful: with only the invoice carrying taxes, any non-zero tax made
+that check delete the invoice forever.
+
+**Posting date.** Both documents are posted on `custom_postex_delivered_on`
+(the courier's `orderDeliveryDate`, else the delivered entry of the status
+history), not on the day the sync noticed. `stock._delivery_posting_date()`
+clamps it so the document can always be submitted:
+
+- never in the future,
+- never before the pickup transfer (the transit warehouse would be negative),
+- never before the Sales Order date,
+- never outside an existing Fiscal Year (falls back to today).
+
 The 4% withholding is booked at **settlement**, not at delivery (see 7.6).
 
 ### 7.5 Return
@@ -352,6 +403,30 @@ The 4% withholding is booked at **settlement**, not at delivery (see 7.6).
    reversalTax`) as `Dr Delivery Charges / Cr Courier Finance` (the wallet takes
    the hit — no invoice exists),
 3. no invoice/credit note (policy: delivered ⇒ invoice; returned ⇒ no invoice).
+
+### 7.5.1 Terminal outcomes
+
+`Delivered` and `Returned` were the only outcomes handled, so every other
+finished parcel left its stock in the transit warehouse and its Sales Order open
+forever. `stock.close_terminals()` runs after the return leg and finishes them:
+
+| Status | Stock | Cost entry | Sales Order |
+|---|---|---|---|
+| `Returned` (no invoice) | In-Transit → Stores (return leg) | `custom_postex_return_charges_entry` | Closed |
+| `Returned` **with** an invoice | **credit note** (`make_return_doc`, `update_stock=1`) → Stores | `custom_postex_return_charges_entry` | Closed |
+| `Lost` / `Damage` / `Stolen` | Material Issue → `Stock Loss` (`custom_postex_loss_entry`) | `custom_postex_terminal_entry` | Closed |
+| `Cancelled` / `Expired` / `Un-Assigned By Me` | In-Transit → Stores if a pickup exists | `custom_postex_terminal_entry` | Closed |
+
+- Closing is `status = Closed` + `custom_postex_closed_on`; the sync clears both
+  when a later poll reports a non-terminal status (a re-booked cancellation, a
+  parcel found again), so a revived order can still be delivered and invoiced.
+- `Delivered` is deliberately **not** closable: ERPNext marks it Completed when
+  it is delivered and billed, and closing it earlier would block the invoice.
+- A booking cancelled from this app (`custom_postex_booking_cancelled`) is never
+  closed — the merchant decides whether the sale dies or ships with another
+  courier.
+- The credit note is only for a return that arrives **after** the invoice; the
+  earlier "returned ⇒ no invoice" rule still applies before invoicing.
 
 ### 7.6 Settlement / payout reconciliation
 
@@ -384,10 +459,11 @@ Per account, for delivered+invoiced orders without `custom_postex_settled_on`:
 
 | Risk | Mitigation |
 |---|---|
-| Two sync runs create two DNs / invoices / transfers / PEs | (a) **one distributed lock per account** (`frappe.utils.synchronization.filelock`) so one account is processed by one worker at a time; (b) "verify-after-create": store the created doc on the SO link field, re-read it, cancel own copy if another run won; (c) unique constraint on Booking Log (sales order + success) |
-| Booking twice | check tracking + Booking Log before POST; store the returned tracking immediately |
-| Duplicate Payment Entry | one PE per (CPR, settlement date, customer, company); unique reference number check before insert |
+| Two sync runs create two DNs / invoices / transfers / PEs | (a) **one distributed lock per account** (`frappe.utils.synchronization.filelock`) so one account is processed by one worker at a time — every entry point takes it, including a backgrounded manual "Sync now"; (b) every link field is claimed with a **compare-and-swap** (`utils.claim_field`: `UPDATE … WHERE field IS NULL OR ''`, then read back) so only one run can own the document and the loser cancels its own copy with its stock/GL effect reversed; (c) unique constraint on Booking Log (sales order + success) |
+| Booking twice | tracking + Booking Log check before POST; one per-order `filelock`; `add-order` is never retried (a timeout/5xx is reconciled by reference, else parked in `custom_postex_booking_doubt`) |
+| Duplicate Payment Entry | one PE per (CPR, settlement date, customer, company); every order of the group is claimed with the same compare-and-swap, and a partially lost claim cancels the whole PE and releases the orders it had claimed |
 | Same tracking used by two SOs | validate uniqueness of `custom_postex_tracking_number` per company at write time |
+| Stale claim on a cancelled/deleted document | `claim_field(..., allow=<current>)` takes over a link whose target is not a submitted document, so an order can never be stuck on a dead claim |
 | Scheduler duplicates | scheduled jobs declared in `hooks.py`; no `Scheduled Job Type` rows to leave behind |
 | Partial failure mid-flow | one transaction per sales order (`frappe.db.savepoint` / rollback on error); failures logged and retried next run |
 

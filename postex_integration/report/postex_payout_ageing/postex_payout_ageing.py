@@ -76,12 +76,22 @@ def _rows(filters, today):
 		conditions.append("so.custom_postex_account = %(account)s")
 		params["account"] = filters.postex_account
 
+	# The real delivery date when the site has it, otherwise when the status was
+	# noticed (older rows), otherwise the invoice date.
+	if frappe.get_meta("Sales Order").has_field("custom_postex_delivered_on"):
+		delivered_on = (
+			"date(ifnull(so.custom_postex_delivered_on,"
+			" ifnull(so.custom_postex_status_changed_on, si.posting_date)))"
+		)
+	else:
+		delivered_on = "date(ifnull(so.custom_postex_status_changed_on, si.posting_date))"
+
 	sql = f"""
 		select so.name as sales_order,
 		       so.custom_postex_sales_invoice as sales_invoice,
 		       so.customer_name,
 		       so.custom_postex_tracking_number,
-		       date(ifnull(so.custom_postex_status_changed_on, si.posting_date)) as delivered_on,
+		       {delivered_on} as delivered_on,
 		       si.outstanding_amount,
 		       si.grand_total
 		from `tabSales Order` so

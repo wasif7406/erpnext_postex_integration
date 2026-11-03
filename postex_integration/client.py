@@ -19,6 +19,7 @@ from .constants import (
 	DEFAULT_BASE_URL,
 	DEFAULT_REQUEST_DELAY,
 	DEFAULT_RUN_REQUEST_BUDGET,
+	EP_CANCEL_ORDER,
 	MIN_REQUEST_DELAY,
 )
 from .exceptions import PostExAPIError, PostExBudgetExceeded
@@ -111,40 +112,61 @@ class PostExClient:
 				f"HTTP {response.status_code} / statusCode {status_code} / {dump_snippet(payload, 300)}"
 			)
 			log_error("PostEx API error", message)
-			raise PostExAPIError(message)
+			error = PostExAPIError(message)
+			# Callers branch on this (e.g. cancel-order: 404 = already gone).
+			error.status_code = response.status_code
+			error.postex_status = status_code
+			# A 5xx may have been processed before it failed: the caller must not
+			# assume the request had no effect (see `book_order`).
+			error.ambiguous = response.status_code >= 500
+			raise error
 		return payload
 
 	def _send(self, method: str, path: str, **kwargs) -> dict:
-		"""Paced, budgeted, retried request. Raises PostExBudgetExceeded/APIError."""
+		"""Paced, budgeted, retried request. Raises PostExBudgetExceeded/APIError.
+
+		**POST is never retried.** `add-order` is not idempotent, so a timeout or
+		a 5xx after PostEx created the order would create a second parcel. The
+		error is raised with `ambiguous = True` instead, and `booking.book_order`
+		looks the reference up in the feed before anything is sent again.
+
+		GET and PUT (cancel) are safe to repeat, so they keep the retry.
+		"""
+		retry = method != "POST"
 		attempt = 0
 		while True:
 			self._pace()
 			try:
-				if method == "POST":
-					response = requests.post(
-						self.base_url + path,
-						headers=self._headers(json_body=True),
-						timeout=self.timeout,
-						**kwargs,
-					)
-				else:
+				if method == "GET":
 					response = requests.get(
 						self.base_url + path,
 						headers=self._headers(),
 						timeout=self.timeout,
 						**kwargs,
 					)
+				else:
+					# POST / PUT: same JSON envelope and headers.
+					response = requests.request(
+						method,
+						self.base_url + path,
+						headers=self._headers(json_body=True),
+						timeout=self.timeout,
+						**kwargs,
+					)
 			except Exception as exc:
 				self._spent()
-				if attempt < RETRIES:
+				if retry and attempt < RETRIES:
 					attempt += 1
 					continue
 				message = f"PostEx {method} {path} failed for account {self.name}: {exc}"
 				log_error("PostEx API error", message)
-				raise PostExAPIError(message) from exc
+				error = PostExAPIError(message)
+				# The request may have reached PostEx before the connection died.
+				error.ambiguous = method == "POST"
+				raise error from exc
 
 			self._spent()
-			if response.status_code >= 500 and attempt < RETRIES:
+			if retry and response.status_code >= 500 and attempt < RETRIES:
 				attempt += 1
 				continue
 			return self._handle(response, path)
@@ -162,6 +184,10 @@ class PostExClient:
 	def post(self, path: str, payload: dict) -> dict:
 		self._ensure_token()
 		return self._send("POST", path, json=payload)
+
+	def put(self, path: str, payload: dict) -> dict:
+		self._ensure_token()
+		return self._send("PUT", path, json=payload)
 
 	# -- typed helpers -----------------------------------------------------
 	def list_orders(self, start_date: str, end_date: str, order_status_id: int = 0) -> list:
@@ -194,6 +220,19 @@ class PostExClient:
 		response = self.post("/services/integration/api/order/v1/add-order", payload)
 		dist = (response or {}).get("dist")
 		return dist if isinstance(dist, dict) else {}
+
+	def cancel_order(self, tracking_number: str) -> dict:
+		"""Cancel a booking at PostEx (guide §3.13: PUT + trackingNumber).
+
+		Returns the response envelope; a 404 is raised as PostExAPIError with
+		`status_code = 404`, which callers treat as "PostEx has no such order".
+		"""
+		response = self.put(
+			EP_CANCEL_ORDER,
+			{"trackingNumber": tracking_number},
+		)
+		dist = (response or {}).get("dist")
+		return dist if isinstance(dist, dict) else response
 
 
 def _as_tracking_dict(item):

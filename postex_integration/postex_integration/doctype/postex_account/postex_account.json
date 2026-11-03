@@ -15,6 +15,7 @@
   "merchant_name",
   "enable_sync",
   "enable_auto_booking",
+  "enable_auto_cancel",
   "dry_run",
   "section_break_api",
   "base_url",
@@ -92,6 +93,13 @@
    "fieldname": "enable_auto_booking",
    "fieldtype": "Check",
    "label": "Enable Auto Booking"
+  },
+  {
+   "default": "0",
+   "description": "Cancel the PostEx booking automatically when its Sales Order is cancelled. Only PostEx bookings that have not been picked up are cancelled; everything else is refused with a reason, exactly like the button.",
+   "fieldname": "enable_auto_cancel",
+   "fieldtype": "Check",
+   "label": "Auto Cancel on Sales Order Cancel"
   },
   {
    "default": "0",
