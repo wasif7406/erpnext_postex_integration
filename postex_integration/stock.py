@@ -27,7 +27,7 @@ visible instead of silent.
 """
 
 import frappe
-from frappe.utils import cint, flt, get_fiscal_year, getdate, now_datetime, nowdate
+from frappe.utils import cint, flt, getdate, now_datetime, nowdate
 
 from .config import AccountConfig
 from .constants import (
@@ -38,9 +38,7 @@ from .constants import (
 	PAYMENT_NOT_PAID,
 	PICKUP_STATUSES,
 	POSTEX_COURIER,
-	ROLE_STOCK_LOSS,
 )
-from .exceptions import PostExConfigError
 from .utils import (
 	bump_failures,
 	claim_field,
@@ -291,11 +289,30 @@ def _delivery_posting_date(so):
 	if posting > today:
 		posting = today
 
-	try:
-		get_fiscal_year(posting)
-	except Exception:
+	# Never post into a period the site has no Fiscal Year for: ERPNext would
+	# refuse the document and the order would quarantine on a date rollover.
+	if not _fiscal_year_covers(posting):
 		return today
 	return posting
+
+
+def _fiscal_year_covers(date) -> bool:
+	"""True when a Fiscal Year contains `date`.
+
+	Read straight from the table on purpose: `get_fiscal_year` lives in
+	`erpnext.accounts.utils` (not `frappe.utils`) and importing it there broke
+	every sync run on the deployed bench.
+	"""
+	try:
+		return bool(
+			frappe.db.exists(
+				"Fiscal Year",
+				{"year_start_date": ("<=", date), "year_end_date": (">=", date)},
+			)
+		)
+	except Exception:
+		# Never block a delivery because the guard itself failed.
+		return True
 
 
 def _existing_invoice(sales_order):
@@ -1002,28 +1019,26 @@ def _write_off_stock(config: AccountConfig, so, result):
 	"""Lost/damaged/stolen: the units in transit are gone, not sold and not back."""
 	if so.get("custom_postex_loss_entry") or not _pickup_submitted(so):
 		return
-	if not config.stock_loss:
-		raise PostExConfigError(
-			f"PostEx Account {config.name}: map the '{ROLE_STOCK_LOSS}' role before a "
-			"lost/damaged/stolen parcel can be written off."
-		)
 
 	rows = []
 	for item, qty in _pending_rows(so):
-		rows.append(
-			{
-				"item_code": item.item_code,
-				"item_name": item.item_name,
-				"description": item.description,
-				"qty": qty,
-				"uom": item.stock_uom,
-				"stock_uom": item.stock_uom,
-				"conversion_factor": 1,
-				"s_warehouse": config.in_transit_warehouse,
-				"expense_account": config.stock_loss,
-				"cost_center": config.cost_center,
-			}
-		)
+		row = {
+			"item_code": item.item_code,
+			"item_name": item.item_name,
+			"description": item.description,
+			"qty": qty,
+			"uom": item.stock_uom,
+			"stock_uom": item.stock_uom,
+			"conversion_factor": 1,
+			"s_warehouse": config.in_transit_warehouse,
+		}
+		# Optional mapping: without it ERPNext falls back to the company's stock
+		# adjustment account, which is exactly what this write-off is.
+		if config.stock_loss:
+			row["expense_account"] = config.stock_loss
+		if config.cost_center:
+			row["cost_center"] = config.cost_center
+		rows.append(row)
 	if not rows:
 		return
 

@@ -282,7 +282,7 @@ book does not accumulate zombie orders and no stock stays in the transit warehou
 |---|---|---|---|
 | Returned, no invoice | In-Transit → Stores | delivery + reversal | done by the return leg, then closed |
 | Returned **after** invoicing | credit note with `update_stock=1` → Stores | delivery + reversal | revenue/COGS reversed; the CN is respected if one already exists |
-| Lost / Damage / Stolen | Material Issue → `Stock Loss` (write-off) | delivery attempt | mapping role `Stock Loss` is required for this branch |
+| Lost / Damage / Stolen | Material Issue → `Stock Loss` (write-off) | delivery attempt | uses the stock-adjustment account when `Stock Loss` is not mapped |
 | Cancelled / Expired / Un-Assigned By Me | In-Transit → Stores when a pickup exists | only if PostEx billed | |
 
 - A booking cancelled **from this app** is never closed: cancelling the booking is not

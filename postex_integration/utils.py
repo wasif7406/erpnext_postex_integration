@@ -45,15 +45,26 @@ def norm(value) -> str:
 # The status-history entry that means "delivered" (guide 3.8.3).
 DELIVERED_HISTORY_CODE = "0005"
 
+# Date-ish keys the order object itself may carry. The guide documents
+# `orderDeliveryDate`; the rest are accepted because PostEx accounts differ.
+DELIVERY_DATE_KEYS = (
+	"orderDeliveryDate",
+	"deliveryDate",
+	"deliveredDate",
+	"delivery_date",
+)
+
 # Date-ish keys a history entry may carry. PostEx does not document one, so the
 # lookup is tolerant instead of guessing a single name.
 HISTORY_DATE_KEYS = (
 	"transactionStatusMessageDate",
 	"transactionStatusDate",
+	"statusDateTime",
 	"transactionDate",
 	"statusDate",
 	"date",
 	"createdAt",
+	"created",
 )
 
 
@@ -78,7 +89,7 @@ def delivery_date(payload):
 	if not isinstance(payload, dict):
 		return None
 
-	candidates = [payload.get("orderDeliveryDate")]
+	candidates = [payload.get(key) for key in DELIVERY_DATE_KEYS]
 	for entry in payload.get("transactionStatusHistory") or []:
 		if not isinstance(entry, dict):
 			continue
