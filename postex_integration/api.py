@@ -7,7 +7,7 @@ from frappe import _
 from frappe.utils import add_days, cint, flt, nowdate
 
 from . import booking as booking_module
-from . import settlement, sync
+from . import settlement, settlement_log, sync
 from .config import account_for_document, default_account, get_account
 from .constants import POSTEX_COURIER
 from .tasks import run_locked
@@ -352,6 +352,29 @@ def reconcile_payouts(account=None, company=None):
 
 
 @frappe.whitelist()
+def reconcile_settlement_log(path, account=None, company=None, dry_run=1):
+	"""Book settlements from a PostEx Settlement Logs CSV export.
+
+	This is the authoritative reconciliation: the `payment-status` API can keep
+	reporting `settle: false` for an order a CPR has already paid, and it does not
+	expose the fee of a returned parcel at all. The export carries both, so pass
+	the file it produced and the settled / returned rows are booked from it.
+
+	Run it with `dry_run=1` first: it reports what it would settle without
+	creating anything. Rows whose Sales Order or invoice cannot be found are
+	returned in `unmatched` / `no_invoice` and never guessed.
+	"""
+	frappe.only_for(WRITE_ROLES)
+	accounts = _resolve_accounts(account, company)
+	if not accounts:
+		frappe.throw(_("No enabled PostEx Account found for the given company/account."))
+	results = {}
+	for row in accounts:
+		results[row] = settlement_log.reconcile(row, path, dry_run=bool(cint(dry_run)))
+	return results
+
+
+@frappe.whitelist()
 def resync_order(sales_order):
 	"""Fetch the current PostEx status of one Sales Order (manual button).
 
@@ -612,6 +635,13 @@ def health():
 			"ambiguous_reference_guard": True,
 			"manual_booking_link": True,
 			"auto_cancel_on_order_cancel": True,
+			"settlement_log_reconciliation": True,
+			"charges_on_prepaid_invoices": True,
+			"settled_invoice_marked_paid": True,
+			"withholding_on_cod": True,
+			"tracking_uniqueness_guard": True,
+			"credit_note_for_dn_invoices": True,
+			"return_cost_from_settlement_log": True,
 		},
 	}
 

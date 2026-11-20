@@ -505,6 +505,8 @@ def delivery_and_return(config: AccountConfig, limit: int = MAX_DOCS_PER_HELPER)
 		"linked_invoices": [],
 		"returns": [],
 		"return_charges": [],
+		"return_delivery_notes": [],
+		"return_cost_missing": [],
 		# terminal outcomes (see `close_terminals`)
 		"closed": [],
 		"credit_notes": [],
@@ -799,10 +801,20 @@ def _book_return_charges(config, so, result):
 	"""A returned parcel cost the delivery attempt plus the reverse leg.
 
 	No invoice exists (returned => no invoice), so the wallet takes the hit.
+
+	The amounts come from the Sales Order, which the poll fills from the API —
+	but PostEx returns `transactionFee: 0` for a *returned* parcel, so this
+	helper frequently has nothing to book and the cost is silently lost. When
+	that happens the order is reported in `return_cost_missing` instead of
+	looking successful; `settlement_log.reconcile` fills the gap from the CPR
+	export, which does carry the fee for returns.
 	"""
 	total = flt(so.get("custom_postex_delivery_fee")) + flt(so.get("custom_postex_delivery_tax")) + flt(
 		so.get("custom_postex_reversal_fee")
 	) + flt(so.get("custom_postex_reversal_tax"))
+	if total <= 0 and not so.get("custom_postex_return_charges_entry"):
+		result.setdefault("return_cost_missing", []).append(so.name)
+		return
 	_book_courier_cost(
 		config,
 		so,
@@ -1105,7 +1117,24 @@ def _existing_credit_note(invoice):
 
 
 def _create_credit_note(config: AccountConfig, so, invoice, result):
-	"""Build the return with ERPNext's own helper, so taxes/stock reverse correctly."""
+	"""Build the return with ERPNext's own helper, so taxes/stock reverse correctly.
+
+	The stock has to come back **the way it left**:
+
+	* invoice created from a **Delivery Note** (`update_stock = 0`, the normal
+	  flow) -> a return Delivery Note brings the units back and reverses COGS,
+	  and the credit note itself must be stock-neutral. Setting
+	  `update_stock = 1` here is what made every late return fail with
+	  "'Update Stock' can not be checked because items are not delivered via
+	  <invoice>", which quarantined the order and left the invoice on
+	  "Not Paid" forever.
+	* invoice moved its own stock (`update_stock = 1`, manual/legacy) -> the
+	  credit note can and must update stock, as before.
+	"""
+	delivery_notes = {item.delivery_note for item in invoice.items if item.get("delivery_note")}
+	if delivery_notes:
+		_create_return_delivery_notes(config, so, invoice, delivery_notes, result)
+
 	try:
 		from erpnext.controllers.sales_and_purchase_return import make_return_doc
 
@@ -1113,7 +1142,7 @@ def _create_credit_note(config: AccountConfig, so, invoice, result):
 	except Exception as exc:
 		raise ValueError(f"could not build the credit note for {invoice.name}: {exc}")
 
-	cn.update_stock = 1
+	cn.update_stock = 0 if delivery_notes else 1
 	for item in cn.items:
 		# stock comes back to the store, not to the transit warehouse
 		item.warehouse = config.stores_warehouse
@@ -1138,6 +1167,48 @@ def _create_credit_note(config: AccountConfig, so, invoice, result):
 	cn.submit()
 	result["credit_notes"].append(f"{so.name}={cn.name}")
 	return cn.name
+
+
+def _create_return_delivery_notes(config: AccountConfig, so, invoice, delivery_notes, result):
+	"""Bring the units back through a return Delivery Note.
+
+	The invoice was raised against a Delivery Note, so its stock already left the
+	transit warehouse; the only correct reversal is a return DN with
+	`update_stock = 1`, which also reverses the COGS the DN booked. ERPNext
+	refuses `update_stock` on a credit note for such an invoice, which is why the
+	credit note is made stock-neutral instead.
+	"""
+	from erpnext.controllers.sales_and_purchase_return import make_return_doc
+
+	for dn_name in sorted(delivery_notes):
+		existing = frappe.db.get_value(
+			"Delivery Note",
+			{"return_against": dn_name, "is_return": 1, "docstatus": ("!=", 2)},
+			"name",
+		)
+		if existing:
+			continue
+		dn = make_return_doc("Delivery Note", dn_name)
+		dn.update_stock = 1
+		for item in dn.items:
+			item.warehouse = config.stores_warehouse
+			item.cost_center = item.cost_center or config.cost_center
+		dn.instructions = (
+			f"PostEx late return {so.get('shopify_order_number') or so.name}: "
+			f"stock back to stores against {dn_name}"
+		)
+		dn.flags.ignore_permissions = True
+		dn.insert(ignore_permissions=True)
+		dn.submit()
+		result.setdefault("return_delivery_notes", []).append(f"{so.name}={dn.name}")
+		# Guard `_ensure_return_stock` against moving the same units again.
+		frappe.db.set_value(
+			"Sales Order",
+			so.name,
+			"custom_postex_return_entry",
+			dn.name,
+			update_modified=False,
+		)
 
 
 def _close_sales_order(so, reason, result):
