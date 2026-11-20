@@ -352,7 +352,7 @@ def reconcile_payouts(account=None, company=None):
 
 
 @frappe.whitelist()
-def reconcile_settlement_log(path, account=None, company=None, dry_run=1):
+def reconcile_settlement_log(path, account=None, company=None, dry_run=1, from_date=None):
 	"""Book settlements from a PostEx Settlement Logs CSV export.
 
 	This is the authoritative reconciliation: the `payment-status` API can keep
@@ -363,6 +363,10 @@ def reconcile_settlement_log(path, account=None, company=None, dry_run=1):
 	Run it with `dry_run=1` first: it reports what it would settle without
 	creating anything. Rows whose Sales Order or invoice cannot be found are
 	returned in `unmatched` / `no_invoice` and never guessed.
+
+	Pass `from_date` (ISO) when the batch was already reconciled by a lump
+	journal entry — every row before it is ignored, which is what stops a
+	historical export from booking the courier cost of each return twice.
 	"""
 	frappe.only_for(WRITE_ROLES)
 	accounts = _resolve_accounts(account, company)
@@ -370,7 +374,9 @@ def reconcile_settlement_log(path, account=None, company=None, dry_run=1):
 		frappe.throw(_("No enabled PostEx Account found for the given company/account."))
 	results = {}
 	for row in accounts:
-		results[row] = settlement_log.reconcile(row, path, dry_run=bool(cint(dry_run)))
+		results[row] = settlement_log.reconcile(
+			row, path, dry_run=bool(cint(dry_run)), from_date=from_date
+		)
 	return results
 
 

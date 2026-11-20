@@ -174,3 +174,24 @@ class TestParseLog(unittest.TestCase):
 	def test_a_missing_file_raises(self):
 		with self.assertRaises(FileNotFoundError):
 			parse_log("/nonexistent/settlement.csv")
+
+
+class TestCutover(unittest.TestCase):
+	"""A historical export must not re-book courier cost already covered by a
+	lump journal entry (25-10 posted 67,319.60 for exactly that)."""
+
+	def test_rows_before_the_cutover_are_ignored(self):
+		from postex_integration import settlement_log
+
+		path = write_log(
+			[
+				["VM1", "111", "a", "1", "Return", "", "", "", "CPR-A", "0", "2026-09-01 00:00:00", "", "", "0", "156", "23.40", "0", "0"],
+				["VM2", "222", "b", "1", "Return", "", "", "", "CPR-B", "0", "2026-11-16 00:00:00", "", "", "0", "156", "23.40", "0", "0"],
+			]
+		)
+		try:
+			rows = settlement_log.parse_log(path)
+			kept = [r for r in rows if (r["cpr_date"] or r["delivered_on"]) >= "2026-11-01"]
+			self.assertEqual([r["tracking"] for r in kept], ["222"])
+		finally:
+			os.unlink(path)

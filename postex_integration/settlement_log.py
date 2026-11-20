@@ -32,7 +32,7 @@ import frappe
 from frappe.utils import flt
 
 from .config import AccountConfig, get_account
-from .constants import PAYMENT_PAID
+from .constants import PAYMENT_NOT_PAID, PAYMENT_PAID
 from .exceptions import PostExConfigError
 from .settlement import settle_order, tracking_conflict
 from .utils import existing_invoice, log_error
@@ -130,14 +130,22 @@ def _invoice_for(order) -> str | None:
 # ---------------------------------------------------------------------------
 # Reconciliation
 # ---------------------------------------------------------------------------
-def reconcile_account_locked(account: str, path: str, dry_run: bool = True) -> dict:
+def reconcile_account_locked(account: str, path: str, dry_run: bool = True, from_date: str = None) -> dict:
 	from .tasks import run_locked
 
-	return run_locked("settle-log", account, lambda acc: reconcile(acc, path, dry_run=dry_run))
+	return run_locked(
+		"settle-log", account, lambda acc: reconcile(acc, path, dry_run=dry_run, from_date=from_date)
+	)
 
 
-def reconcile(account: str = None, path: str = None, dry_run: bool = True) -> dict:
-	"""Book every settled / returned row of one settlement log for one account."""
+def reconcile(account: str = None, path: str = None, dry_run: bool = True, from_date: str = None) -> dict:
+	"""Book every settled / returned row of one settlement log for one account.
+
+	`from_date` (ISO date) ignores rows whose CPR / delivery date is earlier.
+	Set it whenever the batch you are importing was already reconciled by a lump
+	journal entry: a historical export would otherwise book the courier cost of
+	every return a second time (the 25-10 lump covered all of it).
+	"""
 	account_doc = get_account(account)
 	try:
 		config = AccountConfig(account_doc)
@@ -148,7 +156,9 @@ def reconcile(account: str = None, path: str = None, dry_run: bool = True) -> di
 	result = {
 		"account": config.name,
 		"file": os.path.basename(path or ""),
+		"from_date": from_date or "",
 		"rows": len(rows),
+		"skipped_before_cutover": 0,
 		"settled": 0,
 		"already_paid": 0,
 		"return_charges": 0,
@@ -162,6 +172,9 @@ def reconcile(account: str = None, path: str = None, dry_run: bool = True) -> di
 
 	for row in rows:
 		if row["status"] not in (DELIVERED, RETURNED):
+			continue
+		if from_date and (row["cpr_date"] or row["delivered_on"]) < from_date:
+			result["skipped_before_cutover"] += 1
 			continue
 
 		order = _find_order(config.company, row, account=config.name)
@@ -183,7 +196,14 @@ def reconcile(account: str = None, path: str = None, dry_run: bool = True) -> di
 		invoice = frappe.get_doc("Sales Invoice", invoice_name)
 		if invoice.docstatus != 1:
 			continue
-		if invoice.get("custom_courier_payment_status") == PAYMENT_PAID:
+		pay_status = invoice.get("custom_courier_payment_status") or ""
+		if pay_status == PAYMENT_PAID:
+			result["already_paid"] += 1
+			continue
+		# Never re-open an invoice that was deliberately settled some other way:
+		# a zero-value order or a credit note is "No Payment Due", an
+		# approximation import is "Paid (Approx)". Only an open one is settled.
+		if pay_status not in ("", PAYMENT_NOT_PAID):
 			result["already_paid"] += 1
 			continue
 
