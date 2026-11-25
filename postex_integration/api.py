@@ -1,10 +1,11 @@
 """Whitelisted endpoints used by buttons, desk calls and bench execute."""
 
+import os
 import re
 
 import frappe
 from frappe import _
-from frappe.utils import add_days, cint, flt, nowdate
+from frappe.utils import add_days, cint, flt, now_datetime, nowdate
 
 from . import booking as booking_module
 from . import settlement, settlement_log, sync
@@ -380,6 +381,175 @@ def reconcile_settlement_log(path, account=None, company=None, dry_run=1, from_d
 	return results
 
 
+# ---------------------------------------------------------------------------
+# Settlement log upload
+# ---------------------------------------------------------------------------
+SETTLEMENT_EXCEPTION_LIMIT = 500
+
+
+def settlement_file_path(doc) -> str:
+	"""Absolute path of the attached settlement log.
+
+	An `Attach` field stores a URL (`/private/files/x.csv`), not a path, so the
+	file has to be resolved through its `File` record. This is why the upload
+	form exists: running from a shell needed a hand-built site-relative path.
+	"""
+	value = (doc.settlement_file or "").strip()
+	if not value:
+		frappe.throw(_("Attach the settlement log first."))
+	if value.startswith("/private/files/") or value.startswith("/files/"):
+		file_name = frappe.db.get_value("File", {"file_url": value}, "name")
+	else:
+		file_name = value
+	if not file_name:
+		frappe.throw(_("Could not find the attached file {0}.").format(value))
+	path = frappe.get_doc("File", file_name).get_full_path()
+	if not path or not os.path.exists(path):
+		frappe.throw(
+			_("The attached file is not on this server ({0}). Re-upload it.").format(value)
+		)
+	return path
+
+
+@frappe.whitelist()
+def check_settlement_upload(name):
+	"""Dry run: fill the counters and the exceptions table, book nothing."""
+	return _run_settlement_upload(name, dry_run=True)
+
+
+@frappe.whitelist()
+def apply_settlement_upload(name):
+	"""Book the settlements and return costs the file proves."""
+	return _run_settlement_upload(name, dry_run=False)
+
+
+def _run_settlement_upload(name, dry_run=True):
+	frappe.only_for(WRITE_ROLES)
+	doc = frappe.get_doc("PostEx Settlement Upload", name)
+	if doc.status == "Applied":
+		frappe.throw(
+			_("Upload {0} has already been applied. Create a new one for a later export.").format(
+				doc.name
+			)
+		)
+	if not dry_run:
+		blocker = settlement_log.apply_blocker(doc.from_date, doc.allow_full_history)
+		if blocker:
+			frappe.throw(_(blocker))
+
+	result = settlement_log.reconcile(
+		doc.account, settlement_file_path(doc), dry_run=dry_run, from_date=doc.from_date
+	)
+	if not isinstance(result, dict) or result.get("skipped"):
+		frappe.throw(_("Could not read the file: {0}").format((result or {}).get("skipped")))
+
+	doc.rows = result.get("rows", 0)
+	doc.skipped_before_cutover = result.get("skipped_before_cutover", 0)
+	doc.settled = result.get("settled", 0)
+	doc.already_paid = result.get("already_paid", 0)
+	doc.return_charges = result.get("return_charges", 0)
+	doc.nothing_due = result.get("nothing_due", 0)
+	doc.unpaid = result.get("unpaid", 0)
+	doc.partial_count = len(result.get("partial") or [])
+
+	doc.set("exceptions", [])
+	for row in _settlement_exceptions(result):
+		doc.append("exceptions", row)
+
+	if not dry_run:
+		doc.set("booked", [])
+		for je in (result.get("charges_entries") or [])[:SETTLEMENT_EXCEPTION_LIMIT]:
+			doc.append(
+				"booked", {"kind": "Settlement charges", "document_type": "Journal Entry", "document_name": je}
+			)
+		for pe in (result.get("payments") or [])[:SETTLEMENT_EXCEPTION_LIMIT]:
+			doc.append(
+				"booked", {"kind": "Payment", "document_type": "Payment Entry", "document_name": pe}
+			)
+		for je in (result.get("return_costs") or [])[:SETTLEMENT_EXCEPTION_LIMIT]:
+			doc.append(
+				"booked", {"kind": "Return cost", "document_type": "Journal Entry", "document_name": je}
+			)
+
+	doc.status = "Checked" if dry_run else "Applied"
+	if dry_run:
+		doc.checked_on = now_datetime()
+	else:
+		doc.applied_on = now_datetime()
+	doc.summary = (
+		f"{doc.rows} rows · skipped before cutover {doc.skipped_before_cutover} · "
+		f"settled {doc.settled} · already paid {doc.already_paid} · "
+		f"return costs {doc.return_charges} · partial {doc.partial_count} · "
+		f"nothing due {doc.nothing_due} · exceptions {len(doc.exceptions)}"
+	)[:900]
+	doc.flags.ignore_permissions = True
+	doc.save(ignore_permissions=True)
+	frappe.db.commit()
+
+	return {
+		"name": doc.name,
+		"status": doc.status,
+		"dry_run": bool(dry_run),
+		"summary": doc.summary,
+		"exceptions": len(doc.exceptions),
+		"booked": len(doc.get("booked") or []),
+	}
+
+
+def _settlement_exceptions(result) -> list:
+	"""The rows a human has to look at, in the order they matter."""
+	out = []
+	for row in result.get("unmatched") or []:
+		out.append(
+			{
+				"result": "No Sales Order",
+				"order_ref": row.get("ref"),
+				"tracking": row.get("tracking"),
+				"detail": f"PostEx status {row.get('status') or '-'}",
+			}
+		)
+	for name in result.get("no_invoice") or []:
+		out.append(
+			{
+				"result": "No Invoice",
+				"detail": f"{name}: delivered, no submitted invoice — revenue missing",
+			}
+		)
+	for row in result.get("partial") or []:
+		out.append(
+			{
+				"result": "Partial Payment",
+				"order_ref": row.get("ref"),
+				"tracking": row.get("tracking"),
+				"cod": row.get("cod"),
+				"paid": row.get("paid"),
+				"short": row.get("short"),
+				"detail": "not booked: the invoice settles for its whole outstanding",
+			}
+		)
+	for row in result.get("duplicate_trackings") or []:
+		out.append(
+			{
+				"result": "Duplicate Tracking",
+				"order_ref": row.get("sales_order"),
+				"tracking": row.get("tracking"),
+				"detail": f"also used by {row.get('also_used_by')}",
+			}
+		)
+	for row in result.get("failed") or []:
+		if isinstance(row, dict):
+			out.append(
+				{
+					"result": "Failed",
+					"order_ref": row.get("sales_order"),
+					"detail": str(row.get("error"))[:500],
+				}
+			)
+		else:
+			out.append({"result": "Failed", "detail": str(row)[:500]})
+	return out[:SETTLEMENT_EXCEPTION_LIMIT]
+
+
 @frappe.whitelist()
 def resync_order(sales_order):
 	"""Fetch the current PostEx status of one Sales Order (manual button).
@@ -649,6 +819,7 @@ def health():
 			"credit_note_for_dn_invoices": True,
 			"return_cost_from_settlement_log": True,
 			"payment_state_on_all_legs": True,
+			"settlement_log_upload": True,
 		},
 	}
 

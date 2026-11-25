@@ -6,6 +6,11 @@ frappe.ui.form.on("PostEx Account", {
 		if (frm.is_new()) {
 			return;
 		}
+		frm.add_custom_button(__("Settlement log..."), () => {
+			frappe.route_options = { account: frm.doc.name };
+			frappe.new_doc("PostEx Settlement Upload");
+		});
+
 		frm.add_custom_button(__("Create default accounts"), () => {
 			frappe.confirm(
 				__(

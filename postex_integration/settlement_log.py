@@ -99,6 +99,25 @@ def parse_log(path: str) -> list:
 # ---------------------------------------------------------------------------
 # Was this parcel paid?
 # ---------------------------------------------------------------------------
+def apply_blocker(from_date, allow_full_history):
+	"""Why an *apply* must be refused, or None when it may go ahead.
+
+	A check (dry run) is always allowed — it writes nothing. Booking without a
+	cutover is not: every historical row comes into scope, and the parcels whose
+	courier cost a lump journal entry already covered have no per-parcel record
+	to match against, so they would be booked a second time (40,999.67 on the
+	20-11 export alone).
+	"""
+	if from_date or allow_full_history:
+		return None
+	return (
+		"Set 'Reconcile From' (the day after the last CPR already reconciled) or tick "
+		"'Allow Full History' before applying. Without a cutover every historical parcel "
+		"is re-processed and the courier costs already covered by a lump journal entry "
+		"would be booked twice."
+	)
+
+
 def payment_legs(row) -> float:
 	"""Every payment leg PostEx recorded for this parcel.
 

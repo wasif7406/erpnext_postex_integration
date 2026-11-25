@@ -1,0 +1,55 @@
+{
+ "actions": [],
+ "creation": "2026-11-26 10:00:00.000000",
+ "description": "A document a settlement-log apply created: the charges entry, the payout or the return cost of one parcel.",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "kind",
+  "document_type",
+  "document_name"
+ ],
+ "fields": [
+  {
+   "columns": 2,
+   "fieldname": "kind",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "label": "Kind",
+   "options": "\nSettlement charges\nPayment\nReturn cost",
+   "reqd": 1
+  },
+  {
+   "columns": 2,
+   "fieldname": "document_type",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "Document Type",
+   "options": "DocType",
+   "reqd": 1
+  },
+  {
+   "columns": 4,
+   "fieldname": "document_name",
+   "fieldtype": "Dynamic Link",
+   "in_list_view": 1,
+   "label": "Document",
+   "options": "document_type"
+  }
+ ],
+ "index_web_pages_for_search": 0,
+ "istable": 1,
+ "links": [],
+ "modified": "2026-11-26 10:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "PostEx Integration",
+ "name": "PostEx Settlement Booking",
+ "owner": "Administrator",
+ "permissions": [],
+ "quick_entry": 0,
+ "sort_field": "modified",
+ "sort_order": "ASC",
+ "states": [],
+ "track_changes": 0
+}

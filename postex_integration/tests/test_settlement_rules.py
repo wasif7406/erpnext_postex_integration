@@ -18,7 +18,7 @@ import tempfile
 import unittest
 
 from postex_integration.settlement import charge_split, withholding_amount
-from postex_integration.settlement_log import parse_log, payment_state
+from postex_integration.settlement_log import apply_blocker, parse_log, payment_state
 
 LOG_HEADER = [
 	"ORDER_REF_NUMBER",
@@ -240,3 +240,22 @@ class TestPaymentState(unittest.TestCase):
 	def test_a_real_shortfall_is_partial(self):
 		state, _, _ = payment_state(self.row(1999, reserve=1500))
 		self.assertEqual(state, "partial")
+
+
+class TestApplyGuard(unittest.TestCase):
+	"""Booking without a cutover would double-book what a lump JE covered.
+
+	The 20-11 export holds 229 parcels (40,999.67) whose courier cost the
+	25-10 lump already paid for, with no per-parcel record to match on.
+	"""
+
+	def test_a_cutover_allows_apply(self):
+		self.assertIsNone(apply_blocker("2026-11-17", False))
+
+	def test_full_history_is_refused_without_the_tick(self):
+		message = apply_blocker(None, False)
+		self.assertIsNotNone(message)
+		self.assertIn("Reconcile From", message)
+
+	def test_the_tick_allows_a_full_replay(self):
+		self.assertIsNone(apply_blocker(None, True))

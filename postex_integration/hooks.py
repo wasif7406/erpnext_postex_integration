@@ -14,6 +14,8 @@ required_apps = ["erpnext"]
 doctype_js = {
 	"Sales Order": "public/js/sales_order.js",
 	"Sales Invoice": "public/js/sales_invoice.js",
+	"PostEx Account": "public/js/postex_account.js",
+	"PostEx Settlement Upload": "public/js/postex_settlement_upload.js",
 }
 
 # ---------------------------------------------------------------------------
