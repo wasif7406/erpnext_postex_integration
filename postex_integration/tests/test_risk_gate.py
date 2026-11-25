@@ -8,7 +8,12 @@ and an empty band when it has no delivery address) counts as unknown, not safe.
 
 import unittest
 
-from postex_integration.risk import risk_gate_blocker
+from postex_integration.gates import (
+	auto_booking_blocker,
+	gates_enabled,
+	product_gate_blocker,
+	risk_gate_blocker,
+)
 
 
 class Account(dict):
@@ -59,3 +64,74 @@ class TestRiskGate(unittest.TestCase):
 
 	def test_missing_account_or_order_is_safe(self):
 		self.assertIsNone(risk_gate_blocker(None, order(90, "Very High")))
+
+
+class Item(dict):
+	pass
+
+
+def order_with(items, pct=0, band=""):
+	o = Order(custom_return_risk_pct=pct, custom_return_risk_band=band)
+	o["items"] = items
+	return o
+
+
+class TestProductGate(unittest.TestCase):
+	"""Auto-book only the products ERPNext is supposed to book.
+
+	Empty list = no restriction (a ticked box with nothing behind it must not
+	stop every booking). Every line has to match: a mixed parcel is manual.
+	"""
+
+	def acc(self, enabled=1, rows=None):
+		a = Account(enable_item_gate=enabled)
+		a["auto_booking_items"] = rows or []
+		return a
+
+	def test_gate_off_ignores_products(self):
+		a = self.acc(enabled=0, rows=[{"item_code": "A"}])
+		self.assertIsNone(product_gate_blocker(a, order_with([{"item_code": "B"}])))
+
+	def test_empty_list_means_no_restriction(self):
+		self.assertIsNone(product_gate_blocker(self.acc(rows=[]), order_with([{"item_code": "B"}])))
+
+	def test_listed_item_is_booked(self):
+		a = self.acc(rows=[{"item_code": "NEW-1"}])
+		self.assertIsNone(product_gate_blocker(a, order_with([{"item_code": "NEW-1"}])))
+
+	def test_unlisted_item_holds_the_order(self):
+		a = self.acc(rows=[{"item_code": "NEW-1"}])
+		reason = product_gate_blocker(a, order_with([{"item_code": "8907288772696"}]))
+		self.assertIn("8907288772696", reason)
+
+	def test_every_line_must_match(self):
+		a = self.acc(rows=[{"item_code": "NEW-1"}])
+		mixed = [{"item_code": "NEW-1"}, {"item_code": "8907288772696"}]
+		self.assertIsNotNone(product_gate_blocker(a, order_with(mixed)))
+
+	def test_item_group_matches_too(self):
+		a = self.acc(rows=[{"item_group": "Bulbs"}])
+		self.assertIsNone(
+			product_gate_blocker(a, order_with([{"item_code": "X", "item_group": "Bulbs"}]))
+		)
+
+	def test_order_without_items_is_held(self):
+		self.assertIsNotNone(product_gate_blocker(self.acc(rows=[{"item_code": "A"}]), order_with([])))
+
+
+class TestCombinedGate(unittest.TestCase):
+	def test_risk_wins_when_both_gates_apply(self):
+		a = Account(enable_risk_gate=1, auto_book_max_return_risk=35,
+		            enable_item_gate=1, auto_booking_items=[{"item_code": "A"}])
+		reason = auto_booking_blocker(a, order_with([{"item_code": "B"}], pct=90, band="Very High"))
+		self.assertIn("return risk", reason)
+
+	def test_product_gate_applies_when_risk_is_fine(self):
+		a = Account(enable_risk_gate=1, auto_book_max_return_risk=35,
+		            enable_item_gate=1, auto_booking_items=[{"item_code": "A"}])
+		reason = auto_booking_blocker(a, order_with([{"item_code": "B"}], pct=5, band="Low"))
+		self.assertIn("not in the auto-booking list", reason)
+
+	def test_nothing_enabled_is_cheap(self):
+		self.assertFalse(gates_enabled(Account(enable_risk_gate=0, enable_item_gate=0)))
+		self.assertTrue(gates_enabled(Account(enable_risk_gate=0, enable_item_gate=1)))

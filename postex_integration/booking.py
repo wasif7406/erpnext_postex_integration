@@ -27,7 +27,7 @@ from .client import PostExClient
 from .config import account_for_document, config_for_document
 from .constants import POSTEX_COURIER
 from .exceptions import PostExAPIError, PostExConfigError
-from .risk import REVIEW_FIELD, risk_gate_blocker
+from .gates import REVIEW_FIELD, auto_booking_blocker
 from .utils import dump_snippet, existing_invoice, log_error, map_status, norm
 
 try:
@@ -108,7 +108,7 @@ def _book_order(so, account, source, result) -> dict:
 
 	# Automatic booking only: a human pressing the button always wins.
 	if source != "manual":
-		reason = risk_gate_blocker(account_doc, so)
+		reason = auto_booking_blocker(account_doc, so)
 		if reason:
 			return hold_for_review(so, account_doc.name, reason, source, result)
 
@@ -760,7 +760,7 @@ def booking_sweep(account=None, limit=50) -> dict:
 			continue
 		if not (cint(acc.enabled) and cint(acc.enable_auto_booking)):
 			continue
-		reason = risk_gate_blocker(acc, so)
+		reason = auto_booking_blocker(acc, so)
 		if reason:
 			hold_for_review(so, acc.name, reason, "sweep")
 			result.setdefault("held", []).append(f"{so.name}: {reason}")

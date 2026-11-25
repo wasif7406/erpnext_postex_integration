@@ -1,6 +1,7 @@
 import frappe
 from frappe import _
 from frappe.model.document import Document
+from frappe.utils import cint
 
 from postex_integration.config import ensure_single_default, validate_mapping
 
@@ -11,6 +12,7 @@ class PostExAccount(Document):
 		self.validate_name_per_company()
 		ensure_single_default(self)
 		validate_mapping(self)
+		self.validate_auto_booking_policy()
 		self.validate_warnings()
 
 	def on_update(self):
@@ -48,6 +50,43 @@ class PostExAccount(Document):
 				_("Account name {0} already exists for {1} ({2}).").format(
 					self.account_name, self.company, duplicate
 				)
+			)
+
+	def validate_auto_booking_policy(self):
+		"""Each auto-booking row must name an item **or** an item group, not both.
+
+		An empty table with the gate ticked means "no restriction" (see
+		`gates.product_gate_blocker`), so it is allowed — but say so, because a
+		merchant who ticked the box usually expects a restriction.
+		"""
+		seen = set()
+		for row in self.auto_booking_items or []:
+			item, group = (row.item_code or "").strip(), (row.item_group or "").strip()
+			if not item and not group:
+				frappe.throw(
+					_("Auto-Book Products row {0}: set an Item or an Item Group.").format(row.idx)
+				)
+			if item and group:
+				frappe.throw(
+					_(
+						"Auto-Book Products row {0}: use either an Item or an Item Group, not both."
+					).format(row.idx)
+				)
+			key = item or group
+			if key in seen:
+				frappe.throw(
+					_("Auto-Book Products: {0} is listed twice.").format(key)
+				)
+			seen.add(key)
+
+		if cint(self.enable_item_gate) and not (self.auto_booking_items or []):
+			frappe.msgprint(
+				_(
+					"\"Only Auto-Book Listed Products\" is on but the list is empty, so every "
+					"product is still auto-booked. Add the products ERPNext may book."
+				),
+				indicator="orange",
+				alert=True,
 			)
 
 	def validate_warnings(self):

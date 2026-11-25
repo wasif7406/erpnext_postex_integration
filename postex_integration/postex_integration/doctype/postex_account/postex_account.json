@@ -17,6 +17,8 @@
   "enable_auto_booking",
   "enable_risk_gate",
   "auto_book_max_return_risk",
+  "enable_item_gate",
+  "auto_booking_items",
   "enable_auto_cancel",
   "dry_run",
   "section_break_api",
@@ -110,6 +112,21 @@
    "fieldname": "auto_book_max_return_risk",
    "fieldtype": "Percent",
    "label": "Max Return Risk % for Auto Booking"
+  },
+  {
+   "default": "0",
+   "description": "Automatic booking only for the products listed below. Every line of the order must match (by item or by item group); one unlisted product leaves the whole order for manual booking. Manual booking is never blocked.",
+   "fieldname": "enable_item_gate",
+   "fieldtype": "Check",
+   "label": "Only Auto-Book Listed Products"
+  },
+  {
+   "depends_on": "enable_item_gate",
+   "description": "Books ERPNext may create at PostEx automatically. Leave empty to disable the restriction.",
+   "fieldname": "auto_booking_items",
+   "fieldtype": "Table",
+   "label": "Auto-Book Products",
+   "options": "PostEx Auto Booking Item"
   },
   {
    "default": "0",

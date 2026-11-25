@@ -821,6 +821,7 @@ def health():
 			"payment_state_on_all_legs": True,
 			"settlement_log_upload": True,
 			"auto_booking_risk_gate": True,
+			"auto_booking_product_gate": True,
 		},
 	}
 
