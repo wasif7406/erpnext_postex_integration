@@ -6,6 +6,13 @@ frappe.ui.form.on("PostEx Account", {
 		if (frm.is_new()) {
 			return;
 		}
+		if (frm.doc.enable_risk_gate) {
+			frm.add_custom_button(__("Manual booking queue"), () => {
+				frappe.route_options = { company: frm.doc.company };
+				frappe.set_route("query-report", "PostEx Manual Booking Queue");
+			});
+		}
+
 		frm.add_custom_button(__("Settlement log..."), () => {
 			frappe.route_options = { account: frm.doc.name };
 			frappe.new_doc("PostEx Settlement Upload");

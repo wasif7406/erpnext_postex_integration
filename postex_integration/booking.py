@@ -27,6 +27,7 @@ from .client import PostExClient
 from .config import account_for_document, config_for_document
 from .constants import POSTEX_COURIER
 from .exceptions import PostExAPIError, PostExConfigError
+from .risk import REVIEW_FIELD, risk_gate_blocker
 from .utils import dump_snippet, existing_invoice, log_error, map_status, norm
 
 try:
@@ -104,6 +105,12 @@ def _book_order(so, account, source, result) -> dict:
 	existing = _successful_booking(so.name, account_doc.name)
 	if existing:
 		return _fail(so, result, f"already booked ({existing})", source, status="Skipped")
+
+	# Automatic booking only: a human pressing the button always wins.
+	if source != "manual":
+		reason = risk_gate_blocker(account_doc, so)
+		if reason:
+			return hold_for_review(so, account_doc.name, reason, source, result)
 
 	if not account_doc.enabled:
 		return _fail(so, result, f"PostEx Account {account_doc.name} is disabled", source, status="Skipped")
@@ -753,6 +760,11 @@ def booking_sweep(account=None, limit=50) -> dict:
 			continue
 		if not (cint(acc.enabled) and cint(acc.enable_auto_booking)):
 			continue
+		reason = risk_gate_blocker(acc, so)
+		if reason:
+			hold_for_review(so, acc.name, reason, "sweep")
+			result.setdefault("held", []).append(f"{so.name}: {reason}")
+			continue
 		result["checked"] += 1
 		booked = book_order(so.name, account=acc.name, source="sweep")
 		if booked.get("ok"):
@@ -862,6 +874,31 @@ def _log(so, account, reference, status, payload, response, error, source, remar
 		).insert(ignore_permissions=True)
 	except Exception:
 		log_error("PostEx booking log failed", frappe.get_traceback(), "Sales Order", so.name)
+
+
+def hold_for_review(so, account, reason, source, result=None) -> dict:
+	"""Leave an order for manual review instead of booking it.
+
+	The parcel is *not* created: the merchant calls the customer first. The
+	reason is stored on the order so the worklist can show it, and a `Skipped`
+	row goes to the Booking Log so the decision is auditable.
+	"""
+	try:
+		frappe.db.set_value("Sales Order", so.name, REVIEW_FIELD, reason, update_modified=False)
+	except Exception:
+		log_error("PostEx review flag failed", f"{so.name}\n{frappe.get_traceback()}", "Sales Order", so.name)
+	_log(so, account, None, "Skipped", {}, None, None, source, remarks=f"held for review: {reason}")
+	out = dict(result or {})
+	out.update({"ok": 0, "skipped": reason, "so": so.name, "account": account, "source": source})
+	return out
+
+
+def clear_review(so_name) -> None:
+	"""A booking went through: the order no longer needs a human."""
+	try:
+		frappe.db.set_value("Sales Order", so_name, REVIEW_FIELD, None, update_modified=False)
+	except Exception:
+		pass
 
 
 def _fail(so, result, message, source, status="Failed"):

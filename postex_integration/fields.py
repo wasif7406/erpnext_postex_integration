@@ -68,6 +68,15 @@ SALES_ORDER_FIELDS = [
 		"description": "Delivery date reported by PostEx. The Delivery Note and the Sales Invoice are posted on it, so revenue lands in the month it was earned.",
 	},
 	{
+		"fieldname": "custom_postex_review_reason",
+		"label": "Auto-Booking Held",
+		"fieldtype": "Data",
+		"insert_after": "custom_postex_tracking_number",
+		"read_only": 1,
+		"in_standard_filter": 1,
+		"description": "Set when the return-risk gate held this order for manual review instead of booking it automatically.",
+	},
+	{
 		"fieldname": "custom_postex_last_synced_on",
 		"label": "Courier Last Synced On",
 		"fieldtype": "Datetime",

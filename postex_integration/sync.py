@@ -31,6 +31,7 @@ from .constants import (
 	SCAN_LATE_RETURNS,
 )
 from .exceptions import PostExAPIError, PostExBudgetExceeded
+from .risk import risk_gate_blocker
 from .scope import is_our_courier, window_start
 from .utils import delivery_date, field_exists, log_error, map_status, norm
 
@@ -619,6 +620,15 @@ def _maybe_auto_book(account, order, tracking, result):
 	manual "Clear booking doubt" (after a human checked) resets it.
 	"""
 	if not cint(account.get("enable_auto_booking")) or tracking:
+		return
+	# Automatic booking only: hold high-risk orders for a phone call.
+	reason = risk_gate_blocker(account, order)
+	if reason:
+		from .booking import hold_for_review
+
+		so = frappe.get_doc("Sales Order", order.get("name"))
+		hold_for_review(so, account.name, reason, "sync")
+		result["risk_held"] = result.get("risk_held", 0) + 1
 		return
 	if cint(order.get("custom_postex_booking_doubt")):
 		return

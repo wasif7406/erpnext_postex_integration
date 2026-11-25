@@ -15,6 +15,8 @@
   "merchant_name",
   "enable_sync",
   "enable_auto_booking",
+  "enable_risk_gate",
+  "auto_book_max_return_risk",
   "enable_auto_cancel",
   "dry_run",
   "section_break_api",
@@ -93,6 +95,21 @@
    "fieldname": "enable_auto_booking",
    "fieldtype": "Check",
    "label": "Enable Auto Booking"
+  },
+  {
+   "default": "0",
+   "description": "Automatic booking only for orders whose return risk is below the limit. Higher-risk orders (and orders with no score) are held for manual review so the customer can be called first. Manual booking is never blocked.",
+   "fieldname": "enable_risk_gate",
+   "fieldtype": "Check",
+   "label": "Only Auto-Book Low Return Risk"
+  },
+  {
+   "default": "35",
+   "depends_on": "enable_risk_gate",
+   "description": "Auto-book only when the Order's return risk is strictly below this percentage (from the return-risk score on the Sales Order).",
+   "fieldname": "auto_book_max_return_risk",
+   "fieldtype": "Percent",
+   "label": "Max Return Risk % for Auto Booking"
   },
   {
    "default": "0",
