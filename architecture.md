@@ -78,7 +78,7 @@ never touches imported history.
 
 | record | purpose |
 |---|---|
-| **PostEx Account** | token, base URL, `sync_window_days` (60), `withholding_percent` (4), `enable_sync`, `dry_run`, `enable_auto_booking`, `webhook_secret`, `last_run_result` |
+| **PostEx Account** | token, base URL, `sync_window_days` (60), `withholding_percent` (4), `enable_sync`, `dry_run`, `enable_auto_booking`, auto-booking gates (`enable_risk_gate` + `auto_book_max_return_risk`, `enable_item_gate` + `auto_booking_items`), `webhook_secret`, `last_run_result` |
 | **PostEx Account Mapping** (child) | role → account / warehouse / cost centre. Roles: `Courier Finance`, `Debtors`, `Delivery Charges`, `Tax Withheld`, `Unsettled COD`, `Unaccounted`, `Stock Loss`, `In-Transit Warehouse`, `Stores Warehouse`, `Cost Center` |
 | **Sales Order `custom_postex_*`** | the whole state: `account`, `status`, `tracking`, `delivered_on`, `status_changed_on`, `last_attempt_on`, `settled_on`, `payout_checked_on`, `needs_attention`, failure counter, fee fields (`delivery_fee/tax`, `reversal_fee/tax`), and one link per document: `pickup_entry`, `delivery_note`, `sales_invoice`, `return_entry`, `return_charges_entry`, `payout_entry`, `charges_entry` |
 | **Sales Invoice `custom_postex_*`** | `account` (read-only), `tracking`, `status`, `settled_on`, `payout_entry`, `charges_entry` |
@@ -110,6 +110,7 @@ Two fields deserve special mention because they are **join keys, not decoration*
 | cron `07:00` / `08:30` | `webhook_watchdog`, `daily_digest` | nothing (alerts) |
 | webhook | `webhook.receive` | status/tracking **only** — deliberately never documents |
 | desk | `booking.book_order`, `api.resync_order`, `api.requeue_order` | booking / re-read one order |
+| desk | report **`PostEx Manual Booking Queue`** | read-only worklist: orders with no parcel, with risk + held reason |
 | desk | `api.check_settlement_upload`, `api.apply_settlement_upload` | books from a Settlement Logs CSV |
 | `Sales Order.on_submit` | `booking.on_sales_order_submit` | enqueues a booking when the account allows it |
 
@@ -382,6 +383,24 @@ does book) and in the settlement log (`FEE` + `GST`, which the CSV path books).
 price.
 
 ---
+
+## 11A. Automatic booking gates
+
+Booking may be created by ERPNext only for orders that pass the account's gates
+(`gates.auto_booking_blocker`, evaluated inside `_book_order`):
+
+| gate | setting | holds the order when |
+|---|---|---|
+| return risk | `enable_risk_gate` + `auto_book_max_return_risk` (default 35 %) | risk `>=` the limit, or the order has **no score** (`pct 0` + empty band — unknown is not safe) |
+| products | `enable_item_gate` + `auto_booking_items` (item or item group) | **any** line is not listed |
+
+Both are opt-in, and an empty/zero setting means "no restriction" — a ticked box
+with nothing behind it must never stop every booking. A held order is not
+booked and not dropped: the reason goes to `Sales Order.custom_postex_review_reason`,
+a `Skipped` row to `PostEx Booking Log`, and `risk_held` into the run counters.
+`source="manual"` bypasses both gates: pressing "Create PostEx Booking" is the
+merchant's decision. The worklist for everything held is the report
+**PostEx Manual Booking Queue**.
 
 ## 12. Deliberate limits
 
