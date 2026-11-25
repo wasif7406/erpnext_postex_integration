@@ -9,8 +9,11 @@ the fee, GST and the 2%+2% withheld tax — so it is the authoritative source.
 
 This module books from that file and nothing else:
 
-* **Delivered + a reserve payment** -> settle the invoice (charges + payout)
-  using the exact figures the CPR deducted, and mark it paid.
+* **Delivered + the COD fully paid** -> settle the invoice (charges + payout)
+  using the exact figures the CPR deducted, and mark it paid. "Paid" means
+  `upfront + reserve + balance` cover the **whole COD**, not merely that some
+  money arrived: the invoice is settled for its entire outstanding, so a
+  partial payout is reported instead of booked.
 * **Return** -> book the delivery fee + GST of the failed attempt, which the
   API does not expose for returned parcels (`transactionFee` comes back 0), so
   the polling path could never book it.
@@ -40,6 +43,10 @@ from .utils import existing_invoice, log_error
 DELIVERED = "Delivered"
 RETURNED = "Return"
 
+# Rounding tolerance for the "was the whole COD paid?" comparison. PostEx
+# amounts are whole rupees, so half a rupee can only ever be rounding noise.
+PAYMENT_TOLERANCE = 0.5
+
 
 # ---------------------------------------------------------------------------
 # Parsing
@@ -50,6 +57,11 @@ def parse_log(path: str) -> list:
 	The export is comma separated with a UTF-8 BOM and quoted numbers, so a
 	plain `csv.DictReader` after stripping the BOM is enough; every optional
 	column is read defensively (an older export may not carry one).
+
+	PostEx can pay a parcel in more than one leg (an **upfront** amount and the
+	**reserve** released later, plus a balance column that only exists in the
+	export). All three are kept separately so a split payout stays visible, and
+	`payment_state()` decides from their sum rather than from the reserve alone.
 	"""
 	if not path or not os.path.exists(path):
 		raise FileNotFoundError(f"Settlement log not found: {path}")
@@ -66,17 +78,60 @@ def parse_log(path: str) -> list:
 					"customer": (raw.get("CUSTOMER_NAME") or "").strip(),
 					"status": (raw.get("TRANSACTION_STATUS") or "").strip(),
 					"cod": flt(raw.get("COD_AMOUNT")),
+					"upfront": flt(raw.get("UPFRONT_PAYMENT")),
 					"reserve": flt(raw.get("RESERVE_PAYMENT")),
+					"balance": flt(raw.get("BALANCE_PAYMENT")),
 					"fee": flt(raw.get("FEE")),
 					"gst": flt(raw.get("GST")),
 					"itwh": flt(raw.get("ITWH (2%)")),
 					"stwh": flt(raw.get("STWH (2%)")),
+					"upfront_cpr": (raw.get("UPFRONT_CPR_NUMBER") or "").strip(),
+					"reserve_cpr": (raw.get("RESERVE_CPR_NUMBER") or "").strip(),
 					"cpr": (raw.get("RESERVE_CPR_NUMBER") or "").strip(),
 					"cpr_date": (raw.get("RESERVE_CPR_DATE") or "")[:10],
+					"upfront_cpr_date": (raw.get("UPFRONT_CPR_DATE") or "")[:10],
 					"delivered_on": (raw.get("ORDER_DELIVERY_DATE") or "")[:10],
 				}
 			)
 	return rows
+
+
+# ---------------------------------------------------------------------------
+# Was this parcel paid?
+# ---------------------------------------------------------------------------
+def payment_legs(row) -> float:
+	"""Every payment leg PostEx recorded for this parcel.
+
+	Today this merchant is paid in a single weekly **reserve**, so the upfront
+	and balance columns are always zero — but a split payout (upfront first, the
+	reserve later) must not look "unpaid", and must not look "fully paid" after
+	only the first leg either.
+	"""
+	return flt(row.get("upfront")) + flt(row.get("reserve")) + flt(row.get("balance"))
+
+
+def payment_state(row):
+	"""(state, legs, cod) — the one place that decides whether a row was paid.
+
+	`paid` means the **whole COD arrived**, not merely "some money arrived":
+	the caller settles the invoice for its entire outstanding amount, so a
+	partial payout would book cash that has not been received yet.
+
+	* `nothing_due` — a zero-COD order (a free replacement); never "unpaid".
+	* `unpaid`      — no leg paid yet.
+	* `partial`     — some legs paid, the COD not covered; reported, not booked.
+	* `paid`        — legs cover the COD within rounding.
+	"""
+	cod = flt(row.get("cod"))
+	legs = payment_legs(row)
+	if cod <= PAYMENT_TOLERANCE:
+		return "nothing_due", legs, cod
+	if legs <= PAYMENT_TOLERANCE:
+		return "unpaid", legs, cod
+	if legs >= cod - PAYMENT_TOLERANCE:
+		return "paid", legs, cod
+	return "partial", legs, cod
+
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +216,9 @@ def reconcile(account: str = None, path: str = None, dry_run: bool = True, from_
 		"skipped_before_cutover": 0,
 		"settled": 0,
 		"already_paid": 0,
+		"partial": [],
+		"nothing_due": 0,
+		"unpaid": 0,
 		"return_charges": 0,
 		"return_costs": [],
 		"unmatched": [],
@@ -186,8 +244,26 @@ def reconcile(account: str = None, path: str = None, dry_run: bool = True, from_
 			_book_return_cost(config, order, row, result, dry_run=dry_run)
 			continue
 
-		# Delivered: only a row that actually paid counts as settled.
-		if row["reserve"] <= 0:
+		# Delivered: settle only when the whole COD has been paid. A partial
+		# payout is reported, never booked — the invoice is settled for its full
+		# outstanding, so booking on a first leg would overstate the cash.
+		state, legs, cod = payment_state(row)
+		if state == "nothing_due":
+			result["nothing_due"] += 1
+			continue
+		if state == "unpaid":
+			result["unpaid"] += 1
+			continue
+		if state == "partial":
+			result["partial"].append(
+				{
+					"ref": row["ref"],
+					"tracking": row["tracking"],
+					"cod": cod,
+					"paid": round(legs, 2),
+					"short": round(cod - legs, 2),
+				}
+			)
 			continue
 		invoice_name = _invoice_for(order)
 		if not invoice_name:

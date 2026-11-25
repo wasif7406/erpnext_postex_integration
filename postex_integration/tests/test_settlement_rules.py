@@ -18,7 +18,7 @@ import tempfile
 import unittest
 
 from postex_integration.settlement import charge_split, withholding_amount
-from postex_integration.settlement_log import parse_log
+from postex_integration.settlement_log import parse_log, payment_state
 
 LOG_HEADER = [
 	"ORDER_REF_NUMBER",
@@ -195,3 +195,48 @@ class TestCutover(unittest.TestCase):
 			self.assertEqual([r["tracking"] for r in kept], ["222"])
 		finally:
 			os.unlink(path)
+
+
+class TestPaymentState(unittest.TestCase):
+	"""Paid means the whole COD arrived, not that some money arrived.
+
+	PostEx can pay in two legs (upfront then reserve). Settling an invoice books
+	its entire outstanding, so a first leg must not count as paid — but a parcel
+	paid only upfront must not look unpaid forever either.
+	"""
+
+	def row(self, cod, reserve=0, upfront=0, balance=0):
+		return {"cod": cod, "reserve": reserve, "upfront": upfront, "balance": balance}
+
+	def test_the_weekly_reserve_alone_is_paid(self):
+		# this merchant's actual shape: reserve == gross COD
+		state, legs, cod = payment_state(self.row(3598, reserve=3598))
+		self.assertEqual((state, legs, cod), ("paid", 3598.0, 3598.0))
+
+	def test_a_split_payout_is_paid_once_both_legs_land(self):
+		state, _, _ = payment_state(self.row(2000, upfront=1000, reserve=1000))
+		self.assertEqual(state, "paid")
+
+	def test_the_first_leg_alone_is_partial_not_paid(self):
+		state, legs, _ = payment_state(self.row(2000, upfront=1000))
+		self.assertEqual(state, "partial")
+		self.assertEqual(legs, 1000.0)
+
+	def test_paid_entirely_upfront_is_not_unpaid(self):
+		# the bug this replaces: `reserve == 0` used to mean "unpaid" forever
+		state, _, _ = payment_state(self.row(1999, upfront=1999))
+		self.assertEqual(state, "paid")
+
+	def test_no_money_is_unpaid(self):
+		self.assertEqual(payment_state(self.row(1999))[0], "unpaid")
+
+	def test_zero_cod_has_nothing_due(self):
+		# free replacement / -COPY orders: never "unpaid", never settled
+		self.assertEqual(payment_state(self.row(0))[0], "nothing_due")
+
+	def test_rounding_within_tolerance_is_paid(self):
+		self.assertEqual(payment_state(self.row(1999.00, reserve=1998.60))[0], "paid")
+
+	def test_a_real_shortfall_is_partial(self):
+		state, _, _ = payment_state(self.row(1999, reserve=1500))
+		self.assertEqual(state, "partial")
