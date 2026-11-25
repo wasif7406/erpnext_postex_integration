@@ -648,6 +648,7 @@ def health():
 			"tracking_uniqueness_guard": True,
 			"credit_note_for_dn_invoices": True,
 			"return_cost_from_settlement_log": True,
+			"payment_state_on_all_legs": True,
 		},
 	}
 
