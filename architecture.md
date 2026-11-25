@@ -1,686 +1,441 @@
-# PostEx Integration — Multi-Company Architecture
+# PostEx Integration — how the app works
 
-Status: design + implementation. The app lives in this repository
-(`postex_integration/`); see `README.md` for install, configuration and migration.
-Scope: replacing the single-company Server Script integration with a
-GitHub-installed Frappe app that supports **multiple PostEx accounts, possibly
-several per Company**, on the same ERPNext site.
+**Current-state architecture (BUILD 2026-11-26.2).** This document describes the
+code as it runs today. The earlier forward-looking draft ("target model",
+"migration plan", "decisions still open") described the build that is now
+delivered; it lives in git history at `680bb11^` if you need the rationale.
+
+Read this top-down: what the moving parts are, who is allowed to write what,
+then the three flows (poll → documents → money) and the guards that make them
+re-runnable.
 
 ---
 
 ## 1. Purpose
 
-Run several ERPNext Companies on one site, each with **its own PostEx account**
-(its own token, pickup address and money), without any cross-posting:
+One PostEx merchant account (or several) for one ERPNext company (or several),
+with **no accounting name hard-coded anywhere**: every ledger account, warehouse
+and cost centre comes from a `PostEx Account Mapping` row, so the same app serves
+two companies with different charts of accounts.
 
-- Company A sells product A → ships on PostEx account A
-- Company B sells product B → ships on PostEx account B
+What it automates, end to end:
 
-Each company keeps its own chart of accounts, warehouses, customers' receivable,
-courier wallet, tax withheld, and settlement reconciliation.
-
----
-
-## 2. Non-goals
-
-- Moving stock between companies (intercompany stock transfer is out of scope).
-- Multi-currency PostEx settlement (assume PKR only).
-- Courier aggregation/consolidated statements across companies.
-- Replacing the Shopify connector.
-
----
-
-## 3. Today's state (baseline)
-
-| Area | Current implementation |
+| stage | the app does |
 |---|---|
-| Settings | `PostEx Settings` is a **Single** doctype: one token, one base URL, one pickup address, one `enable_auto_booking` |
-| Logic | 7 Server Scripts (`PostEx Sync Core`, `PostEx Order Status Sync` scheduler, `PostEx Sync Now 2`, `PostEx Pickup Transfer`, `PostEx Delivery & Return`, `PostEx Payout Reconciliation`, `PostEx Webhook`, plus `PostEx Book Order`) |
-| Accounts | hard-coded `- AN` names inside the scripts |
-| Warehouses | hard-coded `PostEx In Transit - AN`, `Stores - AN` |
-| Cost center | hard-coded `Main - AN` |
-| Company | taken from the document (`so.company`) — the only company-aware part |
-| Scheduler | one `Scheduled Job Type` for the scheduler script (history: an orphan duplicate had to be removed) |
-| Concurrency | "verify-after-create" guards; no real locks (Redis unavailable inside `safe_exec`) |
+| booking (optional) | creates the order at PostEx, writes the tracking back |
+| status | polls the courier and keeps `Courier Status` + `Courier Tracking ID` current |
+| stock | Stores → In-Transit on pickup, In-Transit → customer on delivery, back to Stores on return |
+| revenue | Delivery Note + Sales Invoice the moment the parcel is delivered |
+| cost | courier fee + GST, 4% withheld tax, return-leg cost |
+| cash | Payment Entry per CPR once PostEx pays, per invoice |
 
-Hard-coded values that block multi-company:
+**Non-goals:** it never posts anything it cannot source from PostEx or the
+merchant's own settlement export; it never books a courier cost from a guess; it
+never touches imported history.
 
-| Constant | Used in |
+---
+
+## 2. System overview
+
+```
+                 ┌────────────────────────────┐
+                 │ PostEx Merchant API        │
+                 │ get-all-order              │
+                 │ get-unbooked-orders        │
+                 │ track-order/{tn}           │
+                 │ payment-status/{tn}        │
+                 │ add-order · cancel-order   │
+                 └─────────────┬──────────────┘
+                               │  HTTPS + per-account token
+                 ┌─────────────▼──────────────┐
+                 │ client.PostExClient        │  1 req/s · 800 req/run
+                 │  paced · budgeted · typed  │  GET retried, POST never
+                 └──────┬──────────┬──────────┘
+                        │          │
+        ┌───────────────▼──┐   ┌───▼──────────────────┐
+        │ sync.py          │   │ settlement.py        │
+        │ poll + map       │   │ API settlement       │
+        └───┬──────────────┘   └───┬──────────────────┘
+            │ run_helpers          │
+   ┌────────▼──────────────────────▼───────────┐
+   │ stock.py   pickup · DN · invoice          │
+   │            return · terminal              │
+   │ booking.py create/cancel/link a booking   │
+   │ webhook.py status only                    │
+   │ settlement_log.py CSV reconcile           │
+   └────────┬──────────────────────────────────┘
+            │ every write through claim_field()
+   ┌────────▼──────────────────────────────────┐
+   │ Sales Order.custom_postex_*                │
+   │ Delivery Note · Sales Invoice · Stock Entry│
+   │ Journal Entry · Payment Entry              │
+   └───────────────────────────────────────────┘
+```
+
+---
+
+## 3. Data model
+
+| record | purpose |
 |---|---|
-| `Postex Finance - AN` | Delivery & Return, Payout |
-| `Debtors - AN` | Payout |
-| `Delivery Charges - AN` | Delivery & Return, Payout |
-| `PostEx Tax Withheld (Advance Tax) - AN` | Payout |
-| `PostEx Unsettled COD - AN` / `PostEx Unaccounted Amount - AN` | reconciliation JEs |
-| `PostEx In Transit - AN`, `Stores - AN` | Pickup, Delivery & Return |
-| `Main - AN` | every JE |
+| **PostEx Account** | token, base URL, `sync_window_days` (60), `withholding_percent` (4), `enable_sync`, `dry_run`, `enable_auto_booking`, `webhook_secret`, `last_run_result` |
+| **PostEx Account Mapping** (child) | role → account / warehouse / cost centre. Roles: `Courier Finance`, `Debtors`, `Delivery Charges`, `Tax Withheld`, `Unsettled COD`, `Unaccounted`, `Stock Loss`, `In-Transit Warehouse`, `Stores Warehouse`, `Cost Center` |
+| **Sales Order `custom_postex_*`** | the whole state: `account`, `status`, `tracking`, `delivered_on`, `status_changed_on`, `last_attempt_on`, `settled_on`, `payout_checked_on`, `needs_attention`, failure counter, fee fields (`delivery_fee/tax`, `reversal_fee/tax`), and one link per document: `pickup_entry`, `delivery_note`, `sales_invoice`, `return_entry`, `return_charges_entry`, `payout_entry`, `charges_entry` |
+| **Sales Invoice `custom_postex_*`** | `account` (read-only), `tracking`, `status`, `settled_on`, `payout_entry`, `charges_entry` |
+| **PostEx Sync Run** (+ `PostEx Sync Failure`) | one row per run: counters, backlog, per-order failures |
+| **PostEx Webhook Log** | every inbound webhook, accepted or rejected |
+| **PostEx Booking Log** | every booking attempt and its response |
+| **PostEx Settlement Upload** (+ Exception, Booking children) | one CSV reconciliation: counters, rows needing a human, documents created |
+
+Two fields deserve special mention because they are **join keys, not decoration**:
+
+* `Sales Order.custom_postex_sales_invoice` — settlement selects on
+  `ifnull(custom_postex_sales_invoice,'') != ''`. Empty means the order is
+  invisible to settlement even if an invoice exists. It is also the
+  "already invoiced" idempotency flag every stock helper tests before creating
+  anything. Nothing outside the app sets it.
+* `Sales Order.custom_postex_account` — the ownership claim. Helpers only touch
+  orders assigned to this account; the sync may claim an unassigned order when
+  its reference appears in this account's feed (`_claim`, a CAS UPDATE).
 
 ---
 
-## 4. Target model
+## 4. Entry points — who may write what
 
-```
-Company A ──1:N──> PostEx Account A1 ──> token A1, pickup A1, accounts A1, warehouses A1
-                └─ PostEx Account A2 ──> token A2, pickup A2, accounts A2, warehouses A2
-Company B ──1:N──> PostEx Account B1 ──> token B1, pickup B1, accounts B1, warehouses B1
-```
-
-Rules:
-
-1. **A Company may have several PostEx Accounts**, but then exactly one must be
-   `is_default` (used when a document has no account set). `(company,
-   account_name)` is unique. If several are enabled and none is flagged, the
-   resolver aborts with a clear error instead of picking one arbitrarily.
-2. Every document created by the integration belongs to the company of the
-   Sales Order being processed — never a hard-coded one.
-3. A Sync run for account A1 only reads/writes Sales Orders where
-   `Sales Order.company == A` **and** the order is assigned to A1 or still
-   unassigned. An unassigned order is claimed by the account whose PostEx feed
-   actually contains its reference (`UPDATE … WHERE custom_postex_account IS NULL`).
-4. Stock/revenue/settlement helpers require `custom_postex_account == that
-   account`, so two accounts of one company can never act on the same order.
-5. Account/warehouse resolution always goes through the mapping, never through
-   a constant.
-6. Disabling an account (or `enable_sync = 0`) stops every flow for that account
-   without touching the other.
-
----
-
-## 5. DocType design
-
-### 5.1 `PostEx Account` (new, regular doctype — not Single)
-
-One record per company.
-
-| Field | Type | Notes |
+| trigger | handler | may write |
 |---|---|---|
-| `company` | Link → Company | **mandatory**; `(company, account_name)` unique, several accounts per company allowed |
-| `account_name` | Data | mandatory, human label |
-| `is_default` | Check | the account used when a document has none set (one per company) |
-| `enabled` | Check | master switch |
-| `enable_sync` | Check | status/tracking sync |
-| `enable_auto_booking` | Check, default 0 | booking on new Sales Orders |
-| `api_token` | Password | per company |
-| `base_url` | Data | default `https://api.postex.pk` |
-| `merchant_name` | Data | informational |
-| `withholding_percent` | Float (4) | advance tax withheld by the courier |
-| `sync_window_days` | Int (60) | list window; older orders use `track-order` |
-| `sync_page_size` | Int (200) | orders scanned per run — see §7.2 |
-| `request_delay_seconds` | Float (1.0) | minimum gap between HTTP calls, floor 0.25 |
-| `run_request_budget` | Int (800) | hard cap on HTTP calls per run |
-| `digest_recipients` | Small Text | optional emails for the daily digest |
-| `pickup_address` | Small Text | booking payload |
-| `pickup_city` | Data | booking payload |
-| `default_order_detail` | Data | booking fallback |
-| `default_weight` | Float (0.5) | booking fallback |
-| `webhook_secret` | Password | per-account webhook endpoint |
-| `last_webhook_on` | Datetime | last call received; the watchdog alerts after 24 h of silence |
-| `last_sync_on` | Datetime | per company |
-| `last_run_result` | Small Text | per company log line |
-| `mapping` | Table → `PostEx Account Mapping` | financial/stock mapping |
+| cron `*/15` | `tasks.sync_all_accounts` → `sync.sync_account_locked` | status/tracking/fees **and documents** (pickup, DN, invoice, return, terminal) |
+| cron `*/30` | `tasks.settle_all_accounts` → `settlement.reconcile_account_locked` | charges JE, Payment Entry, invoice payment status |
+| cron `03:15` daily | `tasks.late_return_sweep` → `sync.sync_late_returns` | status only, Delivered/Returned inside 45 days |
+| cron `07:00` / `08:30` | `webhook_watchdog`, `daily_digest` | nothing (alerts) |
+| webhook | `webhook.receive` | status/tracking **only** — deliberately never documents |
+| desk | `booking.book_order`, `api.resync_order`, `api.requeue_order` | booking / re-read one order |
+| desk | `api.check_settlement_upload`, `api.apply_settlement_upload` | books from a Settlement Logs CSV |
+| `Sales Order.on_submit` | `booking.on_sales_order_submit` | enqueues a booking when the account allows it |
 
-### 5.2 `PostEx Account Mapping` (child table)
-
-| Field | Type | Notes |
-|---|---|---|
-| `role` | Select: `Courier Finance`, `Debtors`, `Delivery Charges`, `Tax Withheld`, `Unsettled COD`, `Unaccounted`, `In-Transit Warehouse`, `Stores Warehouse`, `Cost Center` | one row per role |
-| `account` | Link → Account (filtered: same company, leaf) | filled for financial roles |
-| `warehouse` | Link → Warehouse (filtered: same company, leaf) | filled for stock roles |
-| `cost_center` | Link → Cost Center (filtered: same company, leaf) | filled for the Cost Center role |
-
-`account` / `warehouse` / `cost_center` are the **user's selection** — the user
-creates the account in ERPNext and picks it here. Exactly one of the three is
-filled per row. Full dropdown behaviour, validation and the per-role account
-requirements are in **§6A**.
-
-Alternative (simpler): flat fields on `PostEx Account`
-(`finance_account`, `debtors_account`, `delivery_charges_account`,
-`tax_withheld_account`, `unsettled_cod_account`, `unaccounted_account`,
-`in_transit_warehouse`, `stores_warehouse`, `cost_center`).
-A child table is preferred because it makes validation and future roles easier;
-flat fields are easier to read. **Decision required — see §17.**
-
-### 5.3 `PostEx Booking Log` (optional, recommended)
-
-One row per booking attempt (manual or automatic): company, sales order,
-reference number, payload hash, HTTP status, response, tracking returned,
-user, timestamp. Gives an audit trail and makes duplicate-booking analysis
-possible.
-
-`PostEx Sync Run` records one row per run, including the **Failures** child
-table (`PostEx Sync Failure`: order + step + error) and the unmatched order
-names, so "which order broke, at which step, why" is answered without opening
-the Error Log.
-
-### 5.4 Reuse of existing custom fields
-
-The current Sales Order / Sales Invoice fields stay as they are (they are
-company-agnostic by fieldname):
-
-- Sales Order: `custom_courier`, `custom_postex_status`,
-  `custom_postex_tracking_number`, `custom_postex_last_synced_on`,
-  `custom_postex_delivery_fee/tax`, `custom_postex_reversal_fee/tax`,
-  `custom_qd_*`, `custom_fq_*`, `custom_postex_pickup_entry`,
-  `custom_postex_delivery_note`, `custom_postex_sales_invoice`,
-  `custom_postex_return_entry`, `custom_postex_return_charges_entry`,
-  `custom_postex_payout_entry`, `custom_postex_charges_entry`,
-  `custom_postex_settled_on`, `custom_create_postex_booking` (button)
-- Sales Invoice: same courier/status/tracking/payment fields.
-
-New field recommended: `custom_postex_account` (Link → PostEx Account) on both
-Sales Order and Sales Invoice, so every document records **which account**
-booked/settled it. This makes multi-account reconciliation unambiguous even if
-two accounts issue overlapping tracking ranges.
+Every cron/manual handler runs under `tasks.run_locked(kind, account, fn)` — a
+per-account, per-kind `filelock` with `timeout=0`, so a second concurrent run
+returns `{"skipped": "... already running"}` instead of racing.
 
 ---
 
-## 6. Resolution rules
+## 5. The poll — `sync_account()`
 
-```
-settings   = PostEx Account where company = doc.company
-accounts   = settings.mapping[role].account
-warehouse  = settings.mapping[role].warehouse
-cost       = settings.mapping["Cost Center"].cost_center or company.cost_center
+```python
+sync_account(account, limit=page_size, run_helpers=True, mode="Active"):
+    guard: enabled · enable_sync · token · required custom fields present
+    run = insert PostEx Sync Run(status="Running")
+
+    # one call for the whole window; a ref is NOT unique at PostEx
+    ref_map = client.list_orders(today - sync_window_days, today)   # 60 days
+              #  -> { orderRefNumber: [payload, ...] }
+    client.list_unbooked_orders(...)                                # gap-fill only
+
+    orders = SELECT 200 Sales Orders
+             ORDER BY ifnull(last_attempt_on, '1900-01-01') ASC     # never-tried first
+
+    for order in orders:
+        if budget_exhausted: break                 # stop cleanly; cursor keeps the rest
+
+        payloads = ref_map.get(order.po_no)
+        if len(payloads) > 1:  fail "ambiguous reference"   # never "last one wins"
+        payload = payloads[0] if payloads else None
+        if payload is None and order.tracking:
+            payload = track_order(order.tracking)   # per-order fallback, any age
+        if payload is None:
+            no_data += 1;  maybe_auto_book(order)   # booking it is still fair
+            continue
+
+        if order has no account and not _claim(order, this_account):
+            continue                                # another account won
+        write status (mapped), tracking, fees, delivered_on   # only when changed
+        reopen a Closed SO if the parcel came back to life
+
+    if mode == "Active" and run_helpers:
+        run_helpers(account)                        # §6
+    record summary on the run + Account.last_run_result
 ```
 
-Fallbacks (in order):
+`_touch()` stamps `last_attempt_on` for **every** attempt, success or not, which
+is what makes the 200-row window rotate instead of pinning a broken order.
+`CURSOR_COMMIT_EVERY = 25` commits progress periodically.
 
-1. mapping row for the company,
-2. company defaults (`company.default_*`) where ERPNext provides one,
-3. abort with a clear error — **never** fall back to another company's account.
+### 5.1 What is in scope (`_eligibility`)
 
-Validation at save time of `PostEx Account`: every mapped account must belong
-to the same company, every warehouse must belong to the same company, and no
-two companies may share a mapped account.
+```sql
+docstatus = 1
+AND company = <this company>
+AND ifnull(custom_postex_account,'') IN ('', <this account>)   -- claimable
+AND ifnull(custom_courier,'') IN ('', 'PostEx')                -- never QD / F&Q
+AND ifnull(custom_postex_needs_attention,0) = 0                -- quarantine
+AND ifnull(custom_postex_booking_cancelled,0) = 0              -- merchant's cancel is final
+AND ifnull(custom_shopify_state,'') = ''                       -- imported history is out
+AND ( status blank / Unknown / ACTIVE_STATUSES
+      OR (Cancelled|Expired AND Sales Order not Closed/Completed/Cancelled) )
+```
 
----
+Late-return mode instead requires `status IN (Delivered, Returned)` and
+`status_changed_on >= today - 45`.
 
-## 6A. Account assignment in Settings (what the user picks)
+### 5.2 Status mapping
 
-The **whole point** of `PostEx Account` is that nothing financial is hard-coded:
-the user creates (or reuses) accounts and warehouses in ERPNext, then **selects
-them from dropdowns** in the settings. Every script resolves the role → the
-account the user picked, for that company.
-
-### 6A.1 The role table (all fields are Link dropdowns)
-
-| Role | Required | Field type in settings | ERPNext account requirement | Used by |
-|---|---|---|---|---|
-| **Courier Finance** | ✅ | Link → Account | root **Asset**, account_type **Bank** (or Cash) — the courier wallet | every payout PE (Dr net received) |
-| **Debtors** | ✅ | Link → Account | account_type **Receivable** (party required) | fee JE (Cr), withholding JE (Cr), payout PE (Cr) |
-| **Delivery Charges** | ✅ | Link → Account | root **Expense** (e.g. under Direct Expenses) | delivery fee + GST, return costs |
-| **Tax Withheld** | ✅ | Link → Account | root **Asset** (advance tax) or Expense if the merchant prefers | 4% ITWH+STWH booked at settlement |
-| **Unsettled COD** | ✅ | Link → Account | root **Asset**, no account_type | delivered-but-unpaid invoices (money parked with courier) |
-| **Unaccounted** | ⚠️ optional | Link → Account | root **Liability** (contra) | offsets statement credits not yet tied to invoices; omit only if never reconciling |
-| **In-Transit Warehouse** | ✅ | Link → Warehouse | same company, leaf, `warehouse_type = Transit` | pickup transfer destination, delivery note source |
-| **Stores Warehouse** | ✅ | Link → Warehouse | same company, leaf, not transit | pickup source, return destination |
-| **Cost Center** | ⚠️ optional | Link → Cost Center | same company | applied to every JE line when set |
-
-For each row also store `account` **or** `warehouse` (only one is filled, per
-role type) — the child table keeps both columns and validates that exactly one
-is set.
-
-### 6A.2 Dropdown behaviour
-
-- All Link fields are filtered by the **Company** on the settings doc:
-  - accounts: `company = <company>` and `is_group = 0` (leaf only),
-  - warehouses: `company = <company>` and `is_group = 0`,
-  - cost centers: `company = <company>` and `is_group = 0`.
-- Changing Company re-filters every dropdown (client-side).
-- Each Link shows the account number + name so two similarly-named accounts are
-  distinguishable.
-- The account's `root_type` / `account_type` is validated on save (see 6A.3),
-  so a Receivable can never be picked as Courier Finance by accident.
-
-### 6A.3 Validation on save
-
-Hard errors (block save):
-
-1. `company` missing or a second `PostEx Account` already exists for it.
-2. Any mapped account / warehouse / cost center belongs to a different company.
-3. Any mapped account is a **group** account (must be a leaf).
-4. Root-type mismatch for the role (Asset vs Expense vs Liability as per 6A.1).
-5. `Courier Finance` not of type Bank/Cash; `Debtors` not Receivable.
-6. In-Transit warehouse `warehouse_type != "Transit"`, or equals the Stores
-   warehouse.
-7. The same account mapped to two different roles **inside the same company**
-   (warn, not block — sometimes intentional).
-8. The same account mapped by two different companies (block).
-
-Warnings (allow but flag):
-
-- `Unaccounted` left empty → reconciliation JEs will fail and be logged.
-- `Tax Withheld` left empty → settlement will skip withholding (and the wallet
-  will drift from the statement).
-- `enable_auto_booking` on while `pickup_address`/`pickup_city` are empty.
-
-### 6A.4 Default provisioning for a new company
-
-On creating a `PostEx Account`, offer a **"Create default accounts"** action
-that provisions, with the company's abbreviation:
-
-`Postex Finance - <ABBR>`, `Delivery Charges - <ABBR>`,
-`PostEx Tax Withheld (Advance Tax) - <ABBR>`, `PostEx Unsettled COD - <ABBR>`,
-`PostEx Unaccounted Amount - <ABBR>`, warehouse `PostEx In Transit - <ABBR>`,
-and maps **Debtors** and **Stores** from the company defaults.
-
-That makes onboarding company B a two-click job instead of hunting for the right
-accounts — while still letting the user override any dropdown afterwards.
-
-### 6A.5 Which role is hit by which flow
-
-| Flow | Debit | Credit |
-|---|---|---|
-| Pickup transfer | *(stock only)* Stores → In-Transit | — |
-| Delivery Note | *(stock only)* In-Transit → customer | — |
-| Delivery invoice | Debtors | Sales |
-| Delivery fee JE | Delivery Charges | Debtors |
-| Return transfer | *(stock only)* In-Transit → Stores | — |
-| Return cost JE | Delivery Charges | Courier Finance |
-| Settlement — fee + GST | Delivery Charges | Debtors |
-| Settlement — 4% withheld | Tax Withheld | Debtors |
-| Settlement — payout | Courier Finance | Debtors |
-| Unpaid-but-delivered reclass | Unsettled COD | Debtors (or Courier Finance) |
-| Statement credits not tied to invoices | Courier Finance / Unsettled COD | Unaccounted |
+`constants.STATUS_MAP` is an **ordered** list of substring needles; the first hit
+wins, which is why `"un assigned"` precedes `"unassign"`, `"en route to postex"`
+precedes `"postex warehouse"`, and `"unbook"` precedes `"booked"`. When
+`transactionStatus` is empty, `HISTORY_CODES` (`0001`…`0013`) is consulted —
+unbooked orders carry code `0001` / "At … Warehouse" and would otherwise look
+`Booked`.
 
 ---
 
-## 7. Business flows (per company)
+## 6. Documents — `run_helpers()`
 
-### 7.1 Booking
+Five helpers, each expressed as *"orders for which this document is still
+missing"* plus a `claim_field` CAS after creating it. Order matters:
 
-- **Manual**: button `Create PostEx Booking` on the Sales Order (already
-  exists) → resolves settings by `so.company` → POST `add-order` → writes
-  tracking/status/courier/account back. When the company has more than one
-  enabled account the desk asks which one to use (the order's existing
-  `custom_postex_account` wins if set).
-- **Manual match**: button `Link PostEx Booking` → `api.find_bookings` searches
-  the account feed by reference / phone / customer → the chosen tracking is
-  verified with `track-order` and applied through the same `_write_payload` the
-  sync uses (status, fees, delivery date; a `Success` Booking Log row). This is
-  the escape hatch when the reference does not match (the old OMS numbering, a
-  manual re-booking) and the safe replacement for the removed phone+amount
-  heuristic.
-- **Automatic**: on `Sales Order.on_submit` (app hook) when
-  `settings.enable_auto_booking`; fallback sweep in the sync for orders created
-  while the switch was off.
-- **Cancel**: button `Cancel PostEx Booking` (Courier Detail) → PUT
-  `v1/cancel-order` with the tracking number, then marks the order
-  `custom_postex_booking_cancelled` so the poll and the webhook can never
-  resurrect it; the status is set to `Cancelled`, the dead tracking number is
-  cleared (kept in the Booking Log + comment) and a Booking Log row is written.
-  Refused once stock has moved (submitted pickup transfer) or the order has a
-  delivery note/invoice — that is a return, not a cancellation. A cancelled
-  Sales Order is accepted. Runs under the per-order booking lock.
-- **Auto-cancel**: `Sales Order.on_cancel` → `booking.on_sales_order_cancel` →
-  background `cancel_booking(source="auto")`, only when the account has
-  `enable_auto_cancel` (default off) and only for a PostEx booking that still
-  exists. Same guards as the button; a picked parcel is refused (return it).
-- `Reopen PostEx Booking` clears the flag, the status and the (already cleared)
-  tracking, so the order can be booked again.
-- Guard: never book twice (tracking present, or a Booking Log row already
-  successful for that SO).
-- **Never a blind retry**: `add-order` is not idempotent, so the client does not
-  retry a POST at all. A timeout/5xx is raised as *ambiguous*; `book_order` then
-  looks the reference up in the feed and adopts the tracking if PostEx created
-  the order, otherwise it parks the order in `custom_postex_booking_doubt`.
-  Nothing automatic retries a doubted order; the next sync clears the flag when
-  the reference appears with a tracking number, or a human presses
-  **Clear booking doubt** after checking PostEx.
-- One `filelock("postex-book-<SO>")` per attempt, so a double click / sweep /
-  auto-booking job cannot post for the same order concurrently.
+```python
+pickup_transfer()      # Stores  → In-Transit      (status in PICKUP_STATUSES)
+delivery_and_return()  # In-Transit → customer
+    _create_delivery_notes()   # DELIVERY_WAITING
+    _create_invoices()         # INVOICE_WAITING  (tax + discount rows copied)
+    _process_returns()         # RETURN_WAITING   (In-Transit → Stores + cost)
+    close_terminals()          # TERMINAL_WAITING (write-off / credit note / close)
+helper_backlog()       # what is ready vs blocked, for the run summary
+```
 
-### 7.2 Status sync
+### 6.1 The state machine
 
-Per account, in one scheduled run:
-
-1. Pull `get-all-order` (plus `get-unbooked-orders` as a gap-filler) with that
-   account's token — two paced requests.
-2. Select the page of eligible orders **oldest attempt first**
-   (`custom_postex_last_attempt_on`, NULL first), `sync_page_size` rows.
-   Eligibility is state-based (`scope.py`): moving statuses every run;
-   Delivered/Returned once a day for 45 days; final, other-courier, historical
-   and quarantined orders never.
-3. Match by `orderRefNumber` first (free). Only orders that already carry a
-   tracking number and were not in the feed cost a `track-order` call, and those
-   are counted against `run_request_budget` (stops cleanly when spent).
-4. Update tracking / status / status-changed timestamp / fees / courier /
-   last-synced; reset the failure counter. Stamp `last_attempt_on` on **every**
-   attempt, successful or not — that is the cursor.
-5. Optional: book missing orders when `enable_auto_booking`.
-6. Run the stock/revenue helpers for this account (not for the late-return
-   sweep). Their selection is entirely SQL — including the quarantine and
-   historical-import predicates — because `LIMIT` is applied by the database and
-   a Python-side skip would keep the same stuck rows in the newest 100 slots
-   forever. The run then counts what is still waiting (`helper_backlog`:
-   `ready/blocked` per step) and prints it in the summary.
-7. Write the run record: counts, requests, budget flag, unmatched names, the
-   backlog line and a Failures table (order + step + error); quarantine an order
-   after 5 consecutive failures; update `last_run_result`.
-
-The settlement stream is independent: it polls `payment-status` for delivered +
-invoiced + unsettled orders with its own cursor (`custom_postex_payout_checked_on`),
-so 40 forever-unsettled invoices can no longer occupy every slot.
-
-### 7.3 Pickup transfer
-
-For each company: submitted SO with status that implies pickup, no
-`custom_postex_pickup_entry`, `custom_shopify_state` empty →
-Material Transfer `Stores` → `PostEx In Transit` (that company's warehouses).
-
-### 7.4 Delivery → Delivery Note → Sales Invoice
-
-`Delivered` + pickup entry + no delivery note:
-1. create + submit Delivery Note from `In-Transit` warehouse,
-2. then create + submit Sales Invoice (accrual),
-3. book fee (+GST) as `Dr Delivery Charges / Cr Debtors` against the invoice,
-4. record `custom_postex_account`.
-
-Both documents get the Sales Order's tax **and discount** block through
-`stock._copy_charges()` — every field of `Sales Taxes and Charges`, including
-`tax_amount` (an `Actual` row keeps its amount there, `rate` is 0). Copying it
-to the Delivery Note too is what keeps the "invoice must equal the delivery"
-check meaningful: with only the invoice carrying taxes, any non-zero tax made
-that check delete the invoice forever.
-
-**Posting date.** Both documents are posted on `custom_postex_delivered_on`
-(the courier's `orderDeliveryDate`, else the delivered entry of the status
-history), not on the day the sync noticed. `stock._delivery_posting_date()`
-clamps it so the document can always be submitted:
-
-- never in the future,
-- never before the pickup transfer (the transit warehouse would be negative),
-- never before the Sales Order date,
-- never outside an existing Fiscal Year (falls back to today).
-
-The 4% withholding is booked at **settlement**, not at delivery (see 7.6).
-
-### 7.5 Return
-
-`Returned` + pickup entry + no delivery note + no return entry:
-1. Material Transfer `In-Transit` → `Stores`,
-2. book the return cost (`delivery_fee + delivery_tax + reversalFee +
-   reversalTax`) as `Dr Delivery Charges / Cr Courier Finance` (the wallet takes
-   the hit — no invoice exists),
-3. no invoice/credit note (policy: delivered ⇒ invoice; returned ⇒ no invoice).
-
-### 7.5.1 Terminal outcomes
-
-`Delivered` and `Returned` were the only outcomes handled, so every other
-finished parcel left its stock in the transit warehouse and its Sales Order open
-forever. `stock.close_terminals()` runs after the return leg and finishes them:
-
-| Status | Stock | Cost entry | Sales Order |
+| PostEx status | stock | documents | books |
 |---|---|---|---|
-| `Returned` (no invoice) | In-Transit → Stores (return leg) | `custom_postex_return_charges_entry` | Closed |
-| `Returned` **with** an invoice | **credit note** (`make_return_doc`, `update_stock=1`) → Stores | `custom_postex_return_charges_entry` | Closed |
-| `Lost` / `Damage` / `Stolen` | Material Issue → `Stock Loss` (`custom_postex_loss_entry`) | `custom_postex_terminal_entry` | Closed |
-| `Cancelled` / `Expired` / `Un-Assigned By Me` | In-Transit → Stores if a pickup exists | `custom_postex_terminal_entry` | Closed |
+| `Unbooked`, `Booked` | — | none | — |
+| `Picked By PostEx` … `Out For Delivery`, `Transferred`, `Attempted`, `Delivery Under Review`, `Out For Return` | Stores → **In-Transit** | Material Transfer | — |
+| `Delivered` | In-Transit → customer | Delivery Note, then Sales Invoice | revenue + COGS |
+| `Returned`, never invoiced | In-Transit → Stores | none (no invoice for a return) | delivery-attempt + reversal fee |
+| `Returned` **after** invoicing | **return DN** into Stores | credit note (stock-neutral) | revenue and COGS reversed |
+| `Lost` / `Damage` / `Stolen` | written off | Material Issue | stock loss |
+| `Cancelled` / `Expired` / `Un-Assigned By Me` | In-Transit → Stores | none | cost if PostEx billed it |
 
-- Closing is `status = Closed` + `custom_postex_closed_on`; the sync clears both
-  when a later poll reports a non-terminal status (a re-booked cancellation, a
-  parcel found again), so a revived order can still be delivered and invoiced.
-- `Delivered` is deliberately **not** closable: ERPNext marks it Completed when
-  it is delivered and billed, and closing it earlier would block the invoice.
-- A booking cancelled from this app (`custom_postex_booking_cancelled`) is never
-  closed — the merchant decides whether the sale dies or ships with another
-  courier.
-- The credit note is only for a return that arrives **after** the invoice; the
-  earlier "returned ⇒ no invoice" rule still applies before invoicing.
+`CLOSABLE_STATUSES` drives `close_terminals`; **`Delivered` is deliberately not
+in it** — ERPNext marks a fully delivered+billed order `Completed` itself, and
+closing early would block the invoice that has not been created yet.
 
-### 7.6 Settlement / payout reconciliation
+### 6.2 Backlog line
 
-Per account, for delivered+invoiced orders without `custom_postex_settled_on`:
+Every run summary ends with
 
-1. `payment-status/{tracking}` → `settle`, `settlementDate`, `cpr1`.
-2. When settled:
-   - JE: `Dr Delivery Charges` (fee + GST) **and** `Dr Tax Withheld` (4% of
-     invoice total) / `Cr Debtors` (party + invoice reference),
-   - PE: receive net into the company's `Courier Finance` account, allocated to
-     the invoice,
-   - write `custom_postex_settled_on`, `custom_postex_payout_entry`,
-     `custom_postex_charges_entry`, payment status `Paid`.
-3. When not settled: leave the invoice `Not Paid`.
-4. The account's `Courier Finance` balance must always equal the PostEx wallet
-   statement for that account.
+```
+| backlog ready/blocked: pickup 0/0, delivery 0/3, invoice 0/0, return 0/0, terminal 0/0
+```
 
-### 7.7 Webhook
-
-- One endpoint per account: `/api/method/<app>.webhook/<account_id>/<secret>`,
-  or a single endpoint that resolves the account by tracking number then
-  company.
-- Updates status only. **Never** creates invoices or accounting entries
-  (keeps a single writer for documents).
-- Writes to `PostEx Webhook Log` with the account and company.
+`ready` = queued work, `blocked` = quarantined. A green run that creates nothing
+is therefore distinguishable from a stalled one, and any blocked row adds
+`ALERT: N quarantined order(s) are holding back document creation`.
 
 ---
 
-## 8. Idempotency and concurrency
+## 7. Money
 
-| Risk | Mitigation |
-|---|---|
-| Two sync runs create two DNs / invoices / transfers / PEs | (a) **one distributed lock per account** (`frappe.utils.synchronization.filelock`) so one account is processed by one worker at a time — every entry point takes it, including a backgrounded manual "Sync now"; (b) every link field is claimed with a **compare-and-swap** (`utils.claim_field`: `UPDATE … WHERE field IS NULL OR ''`, then read back) so only one run can own the document and the loser cancels its own copy with its stock/GL effect reversed; (c) unique constraint on Booking Log (sales order + success) |
-| Booking twice | tracking + Booking Log check before POST; one per-order `filelock`; `add-order` is never retried (a timeout/5xx is reconciled by reference, else parked in `custom_postex_booking_doubt`) |
-| Duplicate Payment Entry | one PE per (CPR, settlement date, customer, company); every order of the group is claimed with the same compare-and-swap, and a partially lost claim cancels the whole PE and releases the orders it had claimed |
-| Same tracking used by two SOs | validate uniqueness of `custom_postex_tracking_number` per company at write time |
-| Stale claim on a cancelled/deleted document | `claim_field(..., allow=<current>)` takes over a link whose target is not a submitted document, so an order can never be stuck on a dead claim |
-| Scheduler duplicates | scheduled jobs declared in `hooks.py`; no `Scheduled Job Type` rows to leave behind |
-| Partial failure mid-flow | one transaction per sales order (`frappe.db.savepoint` / rollback on error); failures logged and retried next run |
+### 7.1 Two settlement paths, one core
 
-Server Scripts could not do (a) because `frappe.cache` is unavailable in
-`safe_exec`; the app can.
+```python
+# A. polling (cron */30) — MAX_PAYMENT_STATUS_CALLS = 40 per run
+reconcile_account(account):
+    orders = Delivered + invoiced + not settled, oldest-checked first
+    for order in orders:
+        stamp payout_checked_on                     # failures rotate, never pin
+        if tracking_conflict(tracking): report; continue
+        dist = client.payment_status(tracking)
+        if not dist.settle: continue                # healthy "not yet"
+        settle_order(order, invoice, settled_on=dist.settlementDate, cpr=dist.cpr1)
 
----
+# B. settlement log (desk: Check → Apply)
+reconcile(account, csv, dry_run, from_date):
+    for row in parse_log(csv):
+        if from_date and row.date < from_date: skipped += 1; continue
+        order = find by tracking, then po_no
+        if row.status == "Return":  book_return_cost(fee + gst); continue
+        state = payment_state(row)      # paid | partial | unpaid | nothing_due
+        if state != "paid": report; continue
+        settle_order(order, invoice, fee=row.fee, tax=row.gst,
+                     withholding=row.itwh + row.stwh)     # exact CPR figures
 
-## 9. Scheduled jobs (hooks.py)
+# shared
+settle_order(order, invoice, fee, fee_tax, withholding):
+    if order.charges_entry submitted: return          # idempotent
+    cod = order.grand_total            # withheld tax is on the COD, not the invoice
+    net = fee + fee_tax + withholding
+    to_debtors, excess, role = charge_split(net, invoice.outstanding)
+    JE  Dr Delivery Charges (fee)  Dr Tax Withheld (4% of COD)
+        Cr Debtors (≤ outstanding, party + invoice)
+        Cr Courier Finance / Unsettled COD (the rest)
+    if invoice.outstanding <= 0: mark Paid; return     # parked / prepaid invoice
+    PE  Dr Courier Finance / Cr Debtors  (remaining outstanding)
+```
 
-| Job | Frequency | Notes |
+`payment_state()` decides **paid** on `upfront + reserve + balance ≥ COD − 0.5`,
+not on "some money arrived": the invoice is settled for its whole outstanding, so
+a first leg must be `partial` and is reported, never booked.
+
+### 7.2 What posts where
+
+| event | debit | credit |
 |---|---|---|
-| `sync_all_accounts` | every 15 minutes | loops enabled accounts; enqueues one locked background job per account |
-| `late_return_sweep` | daily 03:15 | Delivered/Returned inside the 45-day window (late returns) |
-| `settle_all_accounts` | every 30 minutes | per account, with its own per-order cursor |
-| `webhook_watchdog` | daily 07:00 | alerts when an account receives no webhook in 24 h |
-| `daily_digest` | daily 08:30 | coverage, unmatched, quarantine, documents, cash expected vs received |
-| `booking_sweep` | hourly | optional catch-up when auto-booking is on |
+| delivery | COGS (via DN) | Stock In Hand |
+| invoice | Debtors | Sales |
+| settlement | Delivery Charges (fee + GST), PostEx Tax Withheld (2% ITWH + 2% STWH) | Debtors |
+| payout | Courier Finance | Debtors |
+| prepaid invoice | Delivery Charges, Tax Withheld | **Unsettled COD** (Debtors has nothing left to credit) |
+| returned parcel | Delivery Charges | **Courier Finance** — the payout is already net of that fee |
+| lost / damaged | Stock Loss | In-Transit stock |
 
-Each job:
-
-- acquires the account lock,
-- checks `enabled` / `enable_sync`,
-- writes `last_sync_on` + `last_run_result` on the account.
+`Courier Finance` must always equal the PostEx wallet statement; `Unsettled COD`
+holds COD collected but not yet matched to an invoice. When a historical batch
+was booked by a lump journal entry, the CSV apply needs a cutover
+(`apply_blocker`) or it would re-book costs the lump already covered.
 
 ---
 
-## 10. API endpoints (whitelisted, login required unless noted)
+## 8. The API client
 
-| Method | Purpose |
+```python
+_send(method, path):
+    if requests_made >= run_request_budget: raise PostExBudgetExceeded   # ~800
+    sleep(request_delay)                          # default 1.0 s, floor 0.25 s
+    try:    response = requests(method, base_url + path, headers={token})
+    except transient:
+            if method == "GET" and attempt < 2: retry
+            error.ambiguous = (method == "POST")  # may have reached PostEx
+            raise PostExAPIError
+    if status >= 500 and method == "GET" and attempt < 2: retry
+    handle(response)                              # 4xx → PostExAPIError(status_code)
+```
+
+*POST is never retried.* A booking that timed out may or may not exist, so the
+order is put into `booking_doubt` and resolved by `track-order` later — never by
+firing the request again.
+
+Typed helpers: `list_orders`, `list_unbooked_orders`, `track_order`,
+`payment_status`, `add_order`, `cancel_order`. Budget exhaustion is **never**
+treated as an order failure: the run stops, `budget_exhausted` is recorded, and
+the cursor resumes next run.
+
+---
+
+## 9. Guards that make everything re-runnable
+
+| mechanism | prevents |
 |---|---|
-| `postex_integration.api.sync_now(company)` | manual sync for one company |
-| `postex_integration.api.book_order(sales_order)` | manual booking (button) |
-| `postex_integration.api.reconcile_payouts(company)` | manual settlement run |
-| `postex_integration.webhook.receive(account, secret)` | **guest**, per-account secret |
+| `utils.claim_field` — conditional `UPDATE … WHERE ifnull(f,'')=''` | two runs creating the same document (the 25-10 duplicate DN/invoice) |
+| verify-after-create — re-read the SO link, cancel our own doc if another run won | cron racing a manual "Sync now" |
+| cursor `last_attempt_on` (NULL first, stamped on every attempt) | a broken order pinning a scan slot |
+| cursor `payout_checked_on` + `MAX_PAYMENT_STATUS_CALLS` | re-checking the same invoice every 30 min |
+| quarantine after `MAX_SYNC_FAILURES` (5) | a permanently-broken order consuming slots |
+| `settlement.tracking_conflict` | one parcel paid twice from two Sales Orders |
+| `payment_state` (legs ≥ COD) | booking cash that has not fully arrived |
+| `apply_blocker` (CSV cutover) | re-booking history a lump JE already covered |
+| `run_locked` filelock (per account, per kind) | two concurrent runs of the same job |
+| `_claim()` on the account field | two accounts both processing one order |
 
-Every endpoint resolves the account from the document's company; none accept an
-account id from the client for write operations.
-
----
-
-## 11. Permissions and security
-
-- `PostEx Account` readable by System Manager / Accounts Manager; writable by
-  System Manager only. Tokens are `Password` fields (encrypted).
-- Company-level row permissions: a user with access to company A must not see
-  company B's account row (use User Permissions on Company).
-- Webhook: per-account secret, constant-time compare, IP allow-list optional.
-- All created documents set `ignore_permissions` only inside the app, with the
-  acting user recorded in `owner` as `Administrator` and the reason in remarks.
+Limits per run: `MAX_DOCS_PER_HELPER = 100`, `MAX_SCAN_CEILING = 2000`,
+`sync_page_size = 200`, `run_request_budget = 800`.
 
 ---
 
-## 12. Reports
+## 10. Reading a run
 
-Existing query reports keep working but need a `company` filter:
+```
+Success  everything eligible was processed
+Partial  budget exhausted, or per-order failures (they stay queued)
+Failed   the run itself threw
+```
 
-| Report | Change |
+| counter | meaning |
 |---|---|
-| `Courier Unpaid Invoices` | add Company filter + column |
-| `Courier Payment Summary` | group by Company, Courier, Payment status |
-| `Approx Settled Invoices` | add Company |
-| `Orders Without Courier` / `Invoices Without Courier` | add Company |
-| **`PostEx Unmatched Orders`** (shipped) | PostEx orders with no record, grouped by reason — the read-only worklist |
-| **`PostEx Payout Ageing`** (shipped) | delivered + invoiced + unsettled, bucketed 0-7 / 8-14 / 15-30 / 30+ days |
-| new: `PostEx Wallet by Company` | wallet balance vs statement per account |
-| new: `PostEx Settlement Reconciliation` | CPR × invoice × fee × withholding |
-
-All reports must filter by the user's permitted companies.
+| `no data N` | no feed ref and `track-order` found nothing — usually no tracking yet |
+| `unassigned N` | same, plus the order belongs to no account |
+| `ambiguous` | the reference matches several PostEx orders → linked by a human |
+| `duplicate_refs` | PostEx itself has several orders on one reference |
+| `backlog ready/blocked` | queued work vs quarantined work |
+| `failures N` | one row per order in the Failures child table |
 
 ---
 
-## 13. Error handling and observability
+## 11. Operating it
 
-- Every external call wrapped; failures written to `Error Log` with company,
-  sales order, tracking and payload hash.
-- `PostEx Account.last_run_result` keeps a one-line summary per company
-  (`orders seen / filled / statuses / booked / failed`).
-- Optional `PostEx Sync Run` doctype (start, end, company, counters, error
-  count) for a run history instead of a single text line.
+**Routine:** nothing. Watch `PostEx Account.last_run_result` (or the daily
+digest). Green runs with `backlog 0/0` need no attention.
 
----
+**When an order is stuck:** the run's Failures table names the step; fix the data,
+then `api.requeue_order(sales_order)` clears the quarantine and puts it at the
+head of the cursor.
 
-## 14. Migration plan (from Server Scripts)
+**When a payout does not appear:** upload the merchant's `Settlement_Logs_*.csv`
+on `PostEx Settlement Upload`, set **Reconcile From** to the day after the last
+CPR already reconciled, press **Check**, read the Exceptions table, then
+**Apply**. The API's `settle` flag is the only automatic signal and it can stay
+`false` for an order a CPR has paid.
 
-1. **Freeze** the current scripts as reference; stop the scheduler script.
-2. Create the app skeleton, DocTypes and fixtures (custom fields) — no logic.
-3. Populate `PostEx Account` for the existing company (Aqreno Nova) with the
-   current accounts/warehouses.
-4. Port in this order, each verified on the existing company before proceeding:
-   1. settings + manual booking
-   2. status sync (read-only effects)
-   3. pickup transfer
-   4. delivery note + invoice + fee
-   5. return leg
-   6. payout + withholding
-   7. webhook
-5. Run a **shadow period**: app writes, scripts disabled; compare
-   wallet/invoice/receivable totals daily.
-6. Delete the Server Scripts and mark them in `AGENTS.md` as replaced.
-7. Only then create company B + PostEx Account B (config only, no code).
-
-Rollback: re-enable the scheduler script; the app's schedulers are disabled per
-account via `enabled = 0`.
+**When a return cost looks missing:** the API returns `transactionFee: 0` for a
+returned parcel; the cost lives in `reversalFee`/`reversalTax` (which the app
+does book) and in the settlement log (`FEE` + `GST`, which the CSV path books).
+`return_cost_missing` in the run summary lists any parcel the poll could not
+price.
 
 ---
 
-## 15. Testing strategy
+## 12. Deliberate limits
 
-- **Unit**: status mapping table (API strings → ERPNext statuses), fee and
-  withholding calculation, payload builder.
-- **Integration** (on a test site): book → pickup → deliver → invoice →
-  settle → return, asserting AR, wallet, stock and tax-withheld balances.
-- **Multi-company test**: same scenario on company A and B in one site,
-  asserting no document of A touches an account of B.
-- **Idempotency test**: run the same sync twice concurrently; assert exactly one
-  DN/invoice/PE.
-- **Reconciliation test**: replay a real settlement CSV and assert the wallet
-  equals the statement.
-
----
-
-## 16. Deployment
-
-- GitHub repo `postex_integration` (Frappe app, `bench get-app`).
-- Frappe Cloud private bench: add the app to the bench, `install-app` per site,
-  deploy via dashboard; migrations run on deploy.
-- `after_install` creates custom fields, the default `PostEx Account` row for
-  the existing company, and the two Client Scripts (or ships them as
-  `doctype_js` + fixtures).
-- Version tags for each release; rollback = deploy the previous tag.
+* **Imported history is frozen.** Orders with `custom_shopify_state` are out of
+  scope for every helper, so the app can never create stock or GL documents for
+  a period that was reconciled by hand. On this site that is 1,719 of 2,121
+  Sales Orders.
+* **45-day late-return window.** After that a parcel's outcome is final.
+* **`outstanding ≤ 0` means "settled elsewhere".** Charges still book, but no
+  cash moves and the invoice is only flagged Paid.
+* **No partial-payment booking.** A payout that does not cover the COD is
+  reported, because settling the invoice books the whole outstanding.
+* **The webhook never creates documents**, so there is exactly one writer for
+  invoices and stock.
 
 ---
 
-## 17. Decisions (were open in the first draft)
+## 13. File map
 
-1. Mapping storage → **child table** `PostEx Account Mapping` (validated per role).
-2. Partial invoicing policy → **one invoice per delivery note** (unchanged).
-3. 4% withholding → booked at **settlement**, percent configurable per account.
-4. Run history → `last_run_result` **plus** a `PostEx Sync Run` doctype.
-5. Webhook → **one URL + secret per account**.
-6. Quick Delivery / Fast And Quick → **out of scope**; PostEx only.
-7. Company B → same site (multi-account supported), a separate site also works.
-
----
-
-## 18. Appendix — current values to map for company A (Aqreno Nova)
-
-These are the values to **select in the settings dropdowns** for company A
-(nothing is hard-coded in the app; they are rows of `PostEx Account Mapping`):
-
-| Role | Current value | Dropdown source |
+| file | lines | job |
 |---|---|---|
-| Courier Finance | `Postex Finance - AN` | Account, company = Aqreno Nova, leaf, Bank |
-| Debtors | `Debtors - AN` | Account, Receivable |
-| Delivery Charges | `Delivery Charges - AN` | Account, Expense |
-| Tax Withheld | `PostEx Tax Withheld (Advance Tax) - AN` | Account, Asset |
-| Unsettled COD | `PostEx Unsettled COD - AN` | Account, Asset |
-| Unaccounted | `PostEx Unaccounted Amount - AN` | Account, Liability |
-| In-Transit Warehouse | `PostEx In Transit - AN` | Warehouse, Transit |
-| Stores Warehouse | `Stores - AN` | Warehouse, leaf |
-| Cost Center | `Main - AN` | Cost Center, leaf |
-
-For company B the user creates (or provisions with **Create default accounts**)
-the equivalents with company B's abbreviation and picks them in company B's
-`PostEx Account` — no code change, only configuration.
+| `stock.py` | 1,226 | pickup / delivery / invoice / return / terminal documents |
+| `booking.py` | 871 | create, cancel, link a PostEx booking; `po_no` bridge |
+| `sync.py` | 855 | feed pull, status mapping, cursors, run record |
+| `api.py` | 843 | whitelisted endpoints (buttons, manual actions, CSV upload) |
+| `settlement.py` | 660 | charges, withheld tax, payout, `payment_state` consumers |
+| `fields.py` | 419 | custom-field definitions (created only when missing) |
+| `settlement_log.py` | 375 | Settlement Logs CSV parse + reconcile |
+| `utils.py` | 362 | `claim_field`, quarantine, failure rows, mapping helpers |
+| `config.py` | 356 | account resolution + role → account/warehouse mapping |
+| `tasks.py` | 337 | cron entry points, per-account file locks |
+| `migrate.py` | 310 | legacy `PostEx Settings` import, default provisioning |
+| `constants.py` | 265 | status vocabulary, code maps, per-run limits |
+| `client.py` | 264 | HTTP client: pacing, budget, retries, typed calls |
+| `webhook.py` | 211 | guest webhook endpoint (status only) |
+| `backfill.py` | 159 | assign accounts to existing orders |
+| `scope.py` | 123 | scan-scope predicate used by sync |
+| `install.py` / `hooks.py` | 99 / 83 | lifecycle, scheduler, `doctype_js` |
 
 ---
 
-## 19. Implementation map
+## 14. Tests and deploy
 
-Everything in §1–§18 is implemented except the items listed under *Deferred*.
+```bash
+# outside a bench (the repo ships a minimal frappe stub for this)
+cd postex_integration && PYTHONPATH=../.teststub python3 -m pytest postex_integration/tests -q   # 119 pass
+```
 
-| Concern | Module |
-|---|---|
-| DocTypes | `postex_integration/postex_integration/doctype/{postex_account, postex_account_mapping, postex_booking_log, postex_sync_run, postex_webhook_log}` |
-| Constants (status table, endpoints, roles) | `constants.py` |
-| Account + mapping resolution, validation | `config.py` |
-| HTTP client (one token per account) | `client.py` |
-| Booking / auto-booking hook / sweep | `booking.py` |
-| Status-tracking-fee sync, run records | `sync.py` |
-| Pickup, delivery note, invoice, return | `stock.py` |
-| Settlement (charges, withholding, payout) | `settlement.py` |
-| Guest webhook (per-account secret) | `webhook.py` |
-| Cron entry points, per-account filelock | `tasks.py` |
-| Whitenlisted API | `api.py` |
-| Custom fields (create-if-missing) | `fields.py` |
-| Install hooks, legacy doctype adoption | `install.py` |
-| Legacy settings import, provisioning | `migrate.py` |
-| Desk behaviour | `public/js/{sales_order, sales_invoice, postex_account}.js` |
+Deploy = push `main`, deploy the app on Frappe Cloud, then verify:
 
-Porting order from §14 is satisfied: settings/booking → sync → pickup → delivery
-→ return → settlement → webhook, each scoped by account.
+```
+/api/method/postex_integration.api.health   →  build + feature flags
+```
 
-### Deviations from the first draft
-
-- **Missing mapping roles are warnings, not save-blocking errors.** Blocking
-  them makes it impossible to save a new account before running
-  "Create default accounts" (the button needs a saved document). Structural
-  errors (wrong company, group account, wrong type, account shared by two
-  companies) still block.
-- **`PostEx Settings` is not created by the app.** It is a legacy UI-created
-  Single doctype; the app reads it once via `migrate.import_legacy_settings`
-  and then ignores it. `PostEx Webhook Log` is *adopted* in `before_install`
-  (module `Custom` → `PostEx Integration`, `custom = 0`) so existing rows survive.
-- **No fixtures.** Custom fields are created from `fields.py` only when
-  missing, so an existing site's layout is never overwritten by `bench migrate`.
-- **One `PostEx Account` may be shared by nothing**: account sharing between
-  companies is a hard validation error, because a ledger account cannot belong
-  to two companies in ERPNext anyway.
-
-### Deferred
-
-- Reports still need a Company filter and grouping by `custom_postex_account`
-  (§12).
-- `PostEx Unsettled COD` / `PostEx Unaccounted Amount` mappings exist but no
-  scheduled job writes them; the historical backlog was reconciled manually.
-- `PostEx Sync Run` has no chart/list view beyond the default; `last_run_result`
-  remains the per-account one-line summary.
-
+`health()` lists a flag per behavioural guarantee (`settlement_log_upload`,
+`payment_state_on_all_legs`, `credit_note_for_dn_invoices`, `tracking_uniqueness_guard`, …)
+so "is the fix live?" is one HTTP call, not a guess.

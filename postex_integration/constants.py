@@ -129,8 +129,8 @@ LOSS_STATUSES = ("Lost", "Damage", "Stolen")
 # Sync scope
 # ---------------------------------------------------------------------------
 # The scope of a sync run is decided by the order's state, never by a row
-# count. See `scope.py` for the predicate and `architecture.md` §7.2 for the
-# sizing table.
+# count. See `scope.py` for the predicate and `architecture.md` §5.1 for the
+# scan scope and §9 for the per-run limits.
 #
 # Still moving: polled on every run.
 ACTIVE_STATUSES = (

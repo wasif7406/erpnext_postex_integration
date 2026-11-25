@@ -14,9 +14,9 @@ Replaces the single-company Server Script integration with a proper app:
 | Webhook | one unguessable URL | one URL + secret per account |
 | History | `last_run_result` text only | `PostEx Sync Run`, `PostEx Booking Log`, `PostEx Webhook Log` |
 
-`architecture.md` documents the design; this README documents **how to install, configure
-and migrate**. Decisions that were open in `architecture.md` §17 are recorded in
-[`architecture.md`](architecture.md#19-implementation-decisions).
+[`architecture.md`](architecture.md) is the **current-state** architecture — how the poll,
+the documents, settlement and the guards actually work today (BUILD-stamped). This README
+documents only **how to install, configure and migrate**.
 
 ---
 
