@@ -37,7 +37,7 @@ from frappe.utils import flt
 from .config import AccountConfig, get_account
 from .constants import PAYMENT_NOT_PAID, PAYMENT_PAID
 from .exceptions import PostExConfigError
-from .settlement import settle_order, tracking_conflict
+from .settlement import booked_return_cost, return_shortfall, settle_order, tracking_conflict
 from .utils import existing_invoice, log_error
 
 DELIVERED = "Delivered"
@@ -355,6 +355,28 @@ def _book_return_cost(config: AccountConfig, order, row, result, dry_run=True):
 		return
 	if order.get("custom_postex_return_charges_entry"):
 		return
+
+	# The link field only knows what this app booked. A manual catch-up entry
+	# never sets it, so ask the ledger as well and count only the shortfall —
+	# otherwise the Check screen promises a booking the apply would skip, or
+	# worse, the apply books a cost that is already there.
+	booked, booked_entry = booked_return_cost(
+		order["name"],
+		(row["tracking"], order.get("shopify_order_number"), order.get("po_no")),
+		config,
+	)
+	if return_shortfall(total, booked) <= 0:
+		result["return_already_booked"] = result.get("return_already_booked", 0) + 1
+		if booked_entry and not dry_run:
+			frappe.db.set_value(
+				"Sales Order",
+				order["name"],
+				"custom_postex_return_charges_entry",
+				booked_entry,
+				update_modified=False,
+			)
+		return
+
 	if dry_run:
 		result["return_charges"] += 1
 		return

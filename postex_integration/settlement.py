@@ -28,7 +28,11 @@ cannot drift apart:
   cost then reduces `Unsettled COD` instead of `Debtors`, because that is where
   the money is parked — and is marked paid instead of silently skipped;
 * one tracking number backed by two Sales Orders is refused rather than paid
-  twice.
+  twice;
+* charges the ledger already holds for an invoice — including a *manual* journal
+  entry, which never sets `custom_postex_charges_entry` — are read back and only
+  the shortfall is posted. Booking the same fee or tax twice credits `Debtors`
+  twice, which is how four settled invoices ended up showing a customer advance.
 """
 
 import frappe
@@ -51,6 +55,10 @@ from .utils import (
 )
 
 SETTLEMENT_CURSOR = "custom_postex_payout_checked_on"
+
+# Anything smaller is rounding noise: PostEx settles in whole rupees and the
+# connection fee/tax carry two decimals.
+CHARGE_EPSILON = 0.01
 
 
 # ---------------------------------------------------------------------------
@@ -326,6 +334,195 @@ def charge_split(net, outstanding):
 	return 0.0, net, "unsettled_cod"
 
 
+def charge_shortfall(needed_fee, needed_wh, booked_fee=0.0, booked_wh=0.0):
+	"""What still has to be posted after the entries already booked for the invoice.
+
+	Both settlement paths only ever guarded on `custom_postex_charges_entry`, a
+	link a *manual* journal entry never sets. Two entries for the same courier
+	cost credit `Debtors` twice, and the customer ends up holding an advance:
+	four settled invoices (Irfan Ali, Kashif Khan, Zafar Iqbal −79.96 each,
+	Muhammad Umar −143.92) went negative by exactly the 4% withheld tax that had
+	already been booked by hand. Posting only the shortfall makes such a manual
+	catch-up harmless.
+	"""
+	fee = flt(flt(needed_fee) - flt(booked_fee), 2)
+	withheld = flt(flt(needed_wh) - flt(booked_wh), 2)
+	if fee < CHARGE_EPSILON:
+		fee = 0.0
+	if withheld < CHARGE_EPSILON:
+		withheld = 0.0
+	return fee, withheld
+
+
+def return_shortfall(total, booked=0.0) -> float:
+	"""What is still missing for a parcel that produced no sale.
+
+	Same rule as `charge_shortfall`, one number: the return leg has no invoice
+	and therefore no withheld tax, only the delivery-attempt + reversal cost.
+	"""
+	remaining = flt(flt(total) - flt(booked), 2)
+	return 0.0 if remaining < CHARGE_EPSILON else remaining
+
+
+def booked_return_cost(sales_order: str, keys, config: AccountConfig):
+	"""(delivery charges already booked, entry) for one returned parcel.
+
+	A return produces no invoice, so there is nothing to reference the way a
+	settlement charge references one. The only place an entry identifies the
+	parcel is its **remark** — the app writes the order reference there, and so
+	does anyone mirroring it by hand — so match the tracking and the order
+	reference.
+
+	The match is narrowed to the return-leg *shape* as well, because a
+	delivered-then-returned parcel also has a settlement entry that debits
+	`Delivery Charges` and names the same reference:
+
+	  * it **credits** `Courier Finance` (the wallet pays the failed attempt), and
+	  * it has **no `Debtors` row** — a settlement charge always credits the
+	    receivable (or `Unsettled COD` when the invoice was already cleared).
+
+	Without this, a manual catch-up journal entry for a return cost (which never
+	sets `custom_postex_return_charges_entry`) was booked a second time by the
+	next settlement-log upload.
+	"""
+	needles = []
+	for key in keys or ():
+		text = str(key or "").strip()
+		if text and text not in needles:
+			needles.append(text)
+	if not needles:
+		return 0.0, None
+
+	params = {
+		"charges": config.delivery_charges,
+		"finance": config.finance,
+		"debtors": config.debtors,
+	}
+	likes = []
+	for index, needle in enumerate(needles):
+		params[f"needle{index}"] = f"%{needle}%"
+		likes.append(f"je.user_remark like %(needle{index})s")
+
+	rows = frappe.db.sql(
+		f"""
+		select je.name as entry, sum(jea.debit_in_account_currency) as debit
+		from `tabJournal Entry` je
+		join `tabJournal Entry Account` jea on jea.parent = je.name
+		where je.docstatus = 1
+		  and jea.account = %(charges)s
+		  and ({" or ".join(likes)})
+		  and exists (
+		      select 1 from `tabJournal Entry Account` paid
+		      where paid.parent = je.name
+		        and paid.account = %(finance)s
+		        and paid.credit_in_account_currency > 0
+		  )
+		  and not exists (
+		      select 1 from `tabJournal Entry Account` recv
+		      where recv.parent = je.name
+		        and recv.account = %(debtors)s
+		  )
+		group by je.name
+		""",
+		params,
+		as_dict=True,
+	)
+	booked = 0.0
+	entry = None
+	for row in rows:
+		booked = flt(booked + flt(row["debit"]), 2)
+		entry = entry or row["entry"]
+	return flt(booked, 2), entry
+
+
+def _booked_charges(invoice_name: str, config: AccountConfig):
+	"""(delivery charges, withholding, entry) already booked for this invoice.
+
+	Read from the ledger, because the link field cannot be trusted to exist: a
+	hand-made entry books the cost and leaves `custom_postex_charges_entry`
+	empty. Only Journal Entries that reference the invoice on a **Debtors** row
+	count — that is how every settlement entry is written, and it keeps the
+	return-leg cost (which never touches Debtors) out of the comparison.
+	"""
+	if not invoice_name:
+		return 0.0, 0.0, None
+	rows = frappe.db.sql(
+		"""
+		select je.name as entry, jea.account as account,
+		       sum(jea.debit_in_account_currency) as debit
+		from `tabJournal Entry` je
+		join `tabJournal Entry Account` jea on jea.parent = je.name
+		where je.docstatus = 1
+		  and jea.account in %(accounts)s
+		  and je.name in (
+		      select parent from `tabJournal Entry Account`
+		      where reference_type = 'Sales Invoice'
+		        and reference_name = %(invoice)s
+		        and account = %(debtors)s
+		        and party_type = 'Customer'
+		  )
+		group by je.name, jea.account
+		""",
+		{
+			"accounts": (config.delivery_charges, config.tax_withheld),
+			"invoice": invoice_name,
+			"debtors": config.debtors,
+		},
+		as_dict=True,
+	)
+	fee = 0.0
+	withheld = 0.0
+	entry = None
+	for row in rows:
+		if row["account"] == config.delivery_charges:
+			fee = flt(fee + flt(row["debit"]), 2)
+		else:
+			withheld = flt(withheld + flt(row["debit"]), 2)
+		entry = entry or row["entry"]
+	return flt(fee, 2), flt(withheld, 2), entry
+
+
+def _entry_charges(entry: str, config: AccountConfig):
+	"""(delivery charges, withholding) an existing journal entry already posted.
+
+	The linked entry can be partial — a manual fee entry that never booked the
+	withheld tax — so its own amounts are read instead of assuming the link means
+	"everything is booked".
+	"""
+	if not entry:
+		return 0.0, 0.0
+	rows = frappe.get_all(
+		"Journal Entry Account",
+		fields=["account", "debit_in_account_currency"],
+		filters={"parent": entry, "account": ["in", [config.delivery_charges, config.tax_withheld]]},
+		limit=20,
+	)
+	fee = 0.0
+	withheld = 0.0
+	for row in rows:
+		if row["account"] == config.delivery_charges:
+			fee = flt(fee + flt(row["debit_in_account_currency"]), 2)
+		else:
+			withheld = flt(withheld + flt(row["debit_in_account_currency"]), 2)
+	return fee, withheld
+
+
+def _adopt_charges_entry(sales_order: str, invoice_name: str, entry: str):
+	"""Record an already-booked charges entry on both documents.
+
+	Nothing is created here: the entry exists from an earlier run or a manual
+	correction, and this only makes sure neither settlement path books it again.
+	"""
+	if not entry:
+		return
+	frappe.db.set_value(
+		"Sales Order", sales_order, "custom_postex_charges_entry", entry, update_modified=False
+	)
+	frappe.db.set_value(
+		"Sales Invoice", invoice_name, "custom_postex_charges_entry", entry, update_modified=False
+	)
+
+
 def _book_charges(
 	config: AccountConfig,
 	order,
@@ -345,8 +542,16 @@ def _book_charges(
 	PostEx withheld, and 4% of it would drift from the settlement log.
 	"""
 	existing = order.custom_postex_charges_entry
-	if existing and _is_submitted("Journal Entry", existing):
-		return invoice
+	if existing and not _is_submitted("Journal Entry", existing):
+		existing = None
+	# The invoice can carry the link while the order does not (a backfill, or an
+	# entry posted against the invoice only).
+	on_invoice = invoice.get("custom_postex_charges_entry")
+	if on_invoice and not _is_submitted("Journal Entry", on_invoice):
+		on_invoice = None
+	if not existing and on_invoice:
+		existing = on_invoice
+		_adopt_charges_entry(order.name, invoice.name, on_invoice)
 
 	if fee is None:
 		fee = flt(order.custom_postex_delivery_fee)
@@ -359,8 +564,20 @@ def _book_charges(
 		withholding = withholding_amount(cod, config.withholding_percent)
 	withholding = flt(withholding, 2)
 
+	# A manual journal entry never sets the link field, so guard on the ledger
+	# too and post only what is still missing. The linked entry counts as booked
+	# as well: it may have covered the fee but not the withheld tax.
+	booked_fee, booked_wh, booked_entry = _booked_charges(invoice.name, config)
+	if existing:
+		link_fee, link_wh = _entry_charges(existing, config)
+		booked_fee = max(booked_fee, link_fee)
+		booked_wh = max(booked_wh, link_wh)
+		booked_entry = booked_entry or existing
+	charges, withholding = charge_shortfall(charges, withholding, booked_fee, booked_wh)
+
 	net = flt(charges + withholding, 2)
 	if net <= 0:
+		_adopt_charges_entry(order.name, invoice.name, booked_entry)
 		return invoice
 
 	outstanding = flt(invoice.outstanding_amount)
@@ -374,7 +591,7 @@ def _book_charges(
 			"company": config.company,
 			"posting_date": settled_on,
 			"user_remark": f"PostEx delivery charges + {flt(config.withholding_percent):g}% tax withheld "
-			f"{order.shopify_order_number or order.name} / {tracking} [{config.name}]",
+			f"{order.shopify_order_number or order.name} / {tracking} / {invoice.name} [{config.name}]",
 		}
 	)
 	if charges > 0:

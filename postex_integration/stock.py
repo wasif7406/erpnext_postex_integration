@@ -39,6 +39,7 @@ from .constants import (
 	PICKUP_STATUSES,
 	POSTEX_COURIER,
 )
+from .settlement import booked_return_cost, return_shortfall
 from .utils import (
 	bump_failures,
 	claim_field,
@@ -828,8 +829,28 @@ def _book_return_charges(config, so, result):
 
 
 def _book_courier_cost(config, so, total, guard_field, bucket, label, step, result):
-	"""Dr Delivery Charges / Cr courier wallet for a parcel that produced no sale."""
-	if total <= 0 or so.get(guard_field):
+	"""Dr Delivery Charges / Cr courier wallet for a parcel that produced no sale.
+
+	Guarded twice, like the settlement charges: the link field catches everything
+	this app booked, and the **ledger** catches a manual catch-up entry, which
+	never sets that link. Only the shortfall is posted, so a hand-booked return
+	cost is adopted instead of being booked again by a settlement-log re-upload.
+	"""
+	if so.get(guard_field):
+		return
+
+	keys = (
+		so.get("custom_postex_tracking_number"),
+		so.get("shopify_order_number"),
+		so.get("po_no"),
+		so.name,
+	)
+	booked, booked_entry = booked_return_cost(so.name, keys, config)
+	remaining = return_shortfall(total, booked) if flt(total) > 0 else 0.0
+	if remaining <= 0:
+		# Everything is already on the ledger: only record where to find it.
+		if booked_entry:
+			_claim_field("Sales Order", so.name, guard_field, booked_entry)
 		return
 
 	je = frappe.get_doc(
@@ -843,12 +864,12 @@ def _book_courier_cost(config, so, total, guard_field, bucket, label, step, resu
 			"accounts": [
 				{
 					"account": config.delivery_charges,
-					"debit_in_account_currency": total,
+					"debit_in_account_currency": remaining,
 					"cost_center": config.cost_center,
 				},
 				{
 					"account": config.finance,
-					"credit_in_account_currency": total,
+					"credit_in_account_currency": remaining,
 					"cost_center": config.cost_center,
 				},
 			],

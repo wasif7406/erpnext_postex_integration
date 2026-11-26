@@ -265,7 +265,8 @@ settle_order(order, invoice, fee, fee_tax, withholding):
     if order.charges_entry submitted: return          # idempotent
     cod = order.grand_total            # withheld tax is on the COD, not the invoice
     net = fee + fee_tax + withholding
-    to_debtors, excess, role = charge_split(net, invoice.outstanding)
+    fee, wh = charge_shortfall(needed_fee, needed_wh, *_booked_charges(invoice))
+    to_debtors, excess, role = charge_split(fee + wh, invoice.outstanding)
     JE  Dr Delivery Charges (fee)  Dr Tax Withheld (4% of COD)
         Cr Debtors (≤ outstanding, party + invoice)
         Cr Courier Finance / Unsettled COD (the rest)
@@ -332,6 +333,8 @@ the cursor resumes next run.
 | cursor `payout_checked_on` + `MAX_PAYMENT_STATUS_CALLS` | re-checking the same invoice every 30 min |
 | quarantine after `MAX_SYNC_FAILURES` (5) | a permanently-broken order consuming slots |
 | `settlement.tracking_conflict` | one parcel paid twice from two Sales Orders |
+| `settlement.charge_shortfall` + `_booked_charges` (ledger read of the fee/tax already booked against the invoice) | booking the same courier cost twice — a manual catch-up JE never sets `custom_postex_charges_entry`, so it credited `Debtors` twice and left four customers (Irfan Ali, Kashif Khan, Zafar Iqbal, Muhammad Umar) in advance on 26-11 |
+| `settlement.return_shortfall` + `booked_return_cost` (ledger read of the return cost, matched on the parcel reference **and** the return-leg shape: credits `Courier Finance`, no `Debtors` row) | the same duplicate on the return leg, which has no invoice to reference — a hand-booked return cost was re-booked by the next settlement-log upload |
 | `payment_state` (legs ≥ COD) | booking cash that has not fully arrived |
 | `apply_blocker` (CSV cutover) | re-booking history a lump JE already covered |
 | `run_locked` filelock (per account, per kind) | two concurrent runs of the same job |
